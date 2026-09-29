@@ -21,9 +21,11 @@ from app.database import get_db
 from app.deps import get_current_user
 from app.models import Company, Document, User
 from app.services.classification import classify_direction
-from app.services.schemas import InvoiceExtraction
-from app.services.validation import validate_invoice
+from app.services.schemas import InvoiceExtraction, PayslipExtraction
+from app.services.validation import validate_invoice, validate_payslip
 from app.tasks import process_piece
+from typing import Any, Literal, Union
+
 
 logger = logging.getLogger("app.pieces")
 
@@ -75,7 +77,7 @@ class SummaryOut(BaseModel):
 
 
 class ReviewIn(BaseModel):
-    fields: InvoiceExtraction
+    fields: dict[str, Any]
     direction: Literal["VENTE", "ACHAT"] | None = None
     action: Literal["save", "validate", "reject"]
     reject_reason: str | None = None
@@ -313,7 +315,7 @@ def review_piece(
         select(Document).where(
             Document.id == piece_id,
             Document.company_id == user.company_id,
-            Document.kind == "FACTURE",
+            Document.kind.in_(KINDS),
         )
     )
     if doc is None:
@@ -321,46 +323,83 @@ def review_piece(
     if doc.processing_status in ("UPLOADED", "PROCESSING"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Traitement automatique pas encore termine")
 
+    # ---------- Rejet : commun aux deux types ----------
     if body.action == "reject":
         doc.processing_status = "REJECTED"
         doc.extracted_data = {
             **(doc.extracted_data or {}),
-            "fields": body.fields.model_dump(mode="json"),
+            "fields": body.fields,
             "reject_reason": body.reject_reason,
         }
         db.commit()
         return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)
 
-    issues = validate_invoice(body.fields, doc.period)
+    # ---------- Validation typee du payload selon le kind ----------
+    if doc.kind == "FACTURE":
+        try:
+            fields = InvoiceExtraction.model_validate(body.fields)
+        except Exception:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Champs de facture invalides")
 
-    company = db.get(Company, doc.company_id)
-    company_mf = company.matricule_fiscal if company else None
-    if body.direction:
-        # L'utilisateur a tranche a la main : on retire l'alerte de classification automatique
-        direction = body.direction
-        issues = [i for i in issues if i.field != "direction"]
+        issues = validate_invoice(fields, doc.period)
+
+        company = db.get(Company, doc.company_id)
+        company_mf = company.matricule_fiscal if company else None
+        if body.direction:
+            direction = body.direction
+            issues = [i for i in issues if i.field != "direction"]
+        else:
+            direction, class_issues = classify_direction(fields.emetteur_mf, fields.client_mf, company_mf)
+            issues += class_issues
+
+        if body.action == "validate":
+            blocking = [i for i in issues if i.severity == "error"]
+            if blocking:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"{len(blocking)} erreur(s) bloquante(s) a corriger avant validation",
+                )
+            if direction is None:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choisissez vente ou achat avant validation")
+            doc.processing_status = "VALIDATED"
+        else:
+            doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
+
+        doc.direction = direction
+        doc.extracted_data = {
+            "fields": fields.model_dump(mode="json"),
+            "issues": [asdict(i) for i in issues],
+            "method": (doc.extracted_data or {}).get("method"),
+        }
+
+    elif doc.kind == "FICHE_PAIE":
+        try:
+            fields = PayslipExtraction.model_validate(body.fields)
+        except Exception:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Champs de fiche de paie invalides")
+
+        issues = validate_payslip(fields, doc.period)
+
+        if body.action == "validate":
+            blocking = [i for i in issues if i.severity == "error"]
+            if blocking:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"{len(blocking)} erreur(s) bloquante(s) a corriger avant validation",
+                )
+            doc.processing_status = "VALIDATED"
+        else:
+            doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
+
+        doc.direction = None  # pas de notion vente/achat pour une fiche de paie
+        doc.extracted_data = {
+            "fields": fields.model_dump(mode="json"),
+            "issues": [asdict(i) for i in issues],
+            "method": (doc.extracted_data or {}).get("method"),
+        }
+
     else:
-        direction, class_issues = classify_direction(body.fields.emetteur_mf, body.fields.client_mf, company_mf)
-        issues += class_issues
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Type de piece non supporte : {doc.kind}")
 
-    if body.action == "validate":
-        blocking = [i for i in issues if i.severity == "error"]
-        if blocking:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"{len(blocking)} erreur(s) bloquante(s) a corriger avant validation",
-            )
-        if direction is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choisissez vente ou achat avant validation")
-        doc.processing_status = "VALIDATED"
-    else:
-        doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
-
-    doc.direction = direction
-    doc.extracted_data = {
-        "fields": body.fields.model_dump(mode="json"),
-        "issues": [asdict(i) for i in issues],
-        "method": (doc.extracted_data or {}).get("method"),
-    }
     db.commit()
     return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)

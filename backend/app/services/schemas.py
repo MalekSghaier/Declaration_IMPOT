@@ -181,3 +181,78 @@ class CompanyProfile(BaseModel):
     dirigeant: str | None = None
     code_tva: str | None = None
     code_categorie: str | None = None
+
+
+class PayslipExtraction(BaseModel):
+    """Champs extraits d'un bulletin de paie tunisien.
+
+    Les bulletins tunisiens n'ont pas de template unique : codes numeriques,
+    disposition et libellés abreges varient d'une societe a l'autre.
+    L'extraction s'appuie sur le LIBELLE de chaque ligne, jamais sur sa position
+    ou son code.
+    """
+
+    salarie_nom: str | None = Field(
+        None,
+        description=(
+            "Nom et prenom du salarie (pas de la societe). "
+            "Cherche 'Nom & Prenom', 'Nom et prenom', ou la ligne juste apres "
+            "un champ 'Matricule'/'Mr'/'Mme'. "
+            "IMPORTANT : si cette zone est noircie, barree, floutee ou autrement rendue "
+            "illisible sur le document, mets null. Ne recopie JAMAIS le libelle d'un champ "
+            "voisin (ex: 'FONCTION', 'SERVICE') a la place d'un nom absent."
+        ),
+    )
+    mois: str | None = Field(
+        None,
+        description=(
+            "Mois et annee concernes par le bulletin (PAS la date d'edition). "
+            "Cherche 'Mois de', 'Mois :', ou une 'Periode du ... au ...' (dans ce cas "
+            "prends le mois de la date de FIN de periode). "
+            "Format de sortie : AAAA-MM (ex: 'novembre 2021' -> '2021-11')."
+        ),
+    )
+    salaire_brut: float | None = Field(
+        None,
+        description=(
+            "Valeur en face de 'SALAIRE BRUT' (ou 'SAL.BRUT'). "
+            "C'est un sous-total, PAS la somme que tu dois recalculer toi-meme : "
+            "prends la valeur telle qu'affichee sur le document."
+        ),
+    )
+    cnss_salariale: float | None = Field(
+        None,
+        description=(
+            "Montant (pas le taux) en face de 'RETENUE CNSS', 'CNSS' ou 'RET.CNSS' "
+            "dans la colonne des retenues/deductions. "
+            "Ne prends pas le taux en pourcentage (ex: '9,18%'), prends le montant en dinars."
+        ),
+    )
+    salaire_imposable: float | None = Field(
+        None,
+        description="Valeur en face de 'SALAIRE IMPOSABLE' ou 'SAL.IMPOS.'.",
+    )
+    retenue_irpp: float | None = Field(
+        None,
+        description=(
+            "Montant en face de 'IRPP', 'I.U.', 'I.UNIQ.', 'IMPOT SUR LE REVENU' "
+            "ou 'Retenue IRPP'. C'est la retenue a la source sur salaire."
+        ),
+    )
+    css: float | None = Field(
+        None,
+        description=(
+            "Montant en face de 'C.S.S', 'CSS', 'CONTRIBUTION S.S' ou "
+            "'Contribution sociale' (contribution sociale de solidarite, distincte de la CNSS). "
+            "Absente sur certains bulletins : dans ce cas mets null."
+        ),
+    )
+    net_a_payer: float | None = Field(
+        None,
+        description=(
+            "Montant final verse au salarie. Priorite 1 : 'NET A PAYER'. "
+            "Priorite 2, si 'NET A PAYER' est absent : 'SALAIRE NET'. "
+            "Ces deux montants peuvent differer (primes ou avantages ajoutes apres impot) : "
+            "prends toujours le dernier total en bas du document, pas un sous-total intermediaire."
+        ),
+    )

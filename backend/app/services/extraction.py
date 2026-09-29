@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services.document_reader import PageText
-from app.services.schemas import InvoiceExtraction, PatenteExtraction, RNEExtraction
+from app.services.schemas import InvoiceExtraction, PatenteExtraction, RNEExtraction, PayslipExtraction
 
 _client_singleton: Mistral | None = None
 _client_lock = threading.Lock()
@@ -326,6 +326,59 @@ REGLES FINALES
 - Preserve la casse et l'orthographe exacte des valeurs extraites."""
 
 
+
+
+
+PAYSLIP_SYSTEM = """Tu extrais les informations d'un bulletin de paie tunisien a partir de son texte
+(markdown, parfois issu d'un OCR imparfait sur un document scanne).
+
+CONTEXTE IMPORTANT
+Les bulletins de paie tunisiens N'ONT PAS de template unique : chaque societe ou logiciel
+de paie utilise sa propre mise en page, ses propres codes numeriques (ex: '01', '4600', '8100'),
+et parfois des libelles abreges. NE TE FIE JAMAIS a un code numerique ni a la position d'une
+ligne : repere chaque valeur par son LIBELLE, en tolerant les abreviations et les variantes
+d'ecriture (accents, majuscules, points).
+
+FORMAT DES NOMBRES
+Les montants sont ecrits avec une virgule comme separateur decimal (ex: '1 995,867' ou '2083,379').
+Convertis-les en nombre avec un point decimal (1995.867). Retire les espaces de separation
+des milliers. Un OCR imparfait peut deformer des chiffres (ex: '1,\\$yo' pour '9,18%') :
+si une valeur est clairement illisible ou aberrante, mets null plutot que de deviner.
+
+REGLES PAR CHAMP
+
+- salarie_nom : le nom du SALARIE (personne employee), jamais le nom de la societe employeuse.
+  Cherche 'Nom & Prenom', 'Nom et prenom', ou une ligne 'Mr'/'Mme' suivie d'un nom.
+
+- mois : le mois ET l'annee auxquels le salaire se rapporte, jamais une date d'edition ou
+  de paiement. Cherche 'Mois de', 'Mois :', ou 'Periode du ... au ...' (dans ce cas, prends
+  le mois de la date de FIN). Reponds au format AAAA-MM.
+
+- salaire_brut : la valeur en face de 'SALAIRE BRUT' (ou 'SAL.BRUT'). C'est un total deja
+  calcule sur le document, ne le recalcule jamais toi-meme a partir des lignes de gains.
+
+- cnss_salariale : le MONTANT (pas le taux en %) en face de 'RETENUE CNSS', 'CNSS' ou
+  'RET.CNSS', dans la colonne des retenues. Si les deux (taux et montant) apparaissent sur
+  la meme ligne, prends le montant en dinars, jamais le pourcentage.
+
+- salaire_imposable : la valeur en face de 'SALAIRE IMPOSABLE' ou 'SAL.IMPOS.'.
+
+- retenue_irpp : la valeur en face de 'IRPP', 'I.U.', 'I.UNIQ.' ou 'IMPOT SUR LE REVENU'.
+
+- css : la valeur en face de 'C.S.S', 'CSS' ou 'CONTRIBUTION S.S' (contribution sociale de
+  solidarite, DIFFERENTE de la CNSS). Si cette ligne n'existe pas sur le document, mets null,
+  ne l'invente jamais.
+
+- net_a_payer : le montant final verse au salarie. Priorite 1 : la ligne 'NET A PAYER'.
+  Priorite 2, uniquement si 'NET A PAYER' est absente : 'SALAIRE NET'. Si les deux lignes
+  existent avec des valeurs differentes (primes ajoutees apres impot, par exemple), prends
+  toujours 'NET A PAYER', qui est le dernier total du document.
+
+REGLES FINALES
+- Reponds uniquement selon le schema fourni.
+- N'invente jamais de valeur. Si un champ n'est pas present ou illisible, mets null.
+- Si le document fourni n'est manifestement pas un bulletin de paie, mets tous les champs a null."""
+
 def extract_invoice(pages: list[PageText]) -> InvoiceExtraction:
     return _extract(pages, InvoiceExtraction, INVOICE_SYSTEM)
 
@@ -337,3 +390,7 @@ def extract_patente(pages: list[PageText]) -> PatenteExtraction:
 def extract_rne(pages: list[PageText]) -> RNEExtraction:
     # Page 3 = mentions legales, on la garde si elle existe mais le LLM saura l'ignorer.
     return _extract(pages, RNEExtraction, RNE_SYSTEM)
+
+
+def extract_payslip(pages: list[PageText]) -> PayslipExtraction:
+    return _extract(pages, PayslipExtraction, PAYSLIP_SYSTEM)

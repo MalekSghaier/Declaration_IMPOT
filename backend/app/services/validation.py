@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
-from app.services.schemas import InvoiceExtraction
+from app.services.schemas import InvoiceExtraction, PayslipExtraction
 
 TAUX_VALIDES = {Decimal(x) for x in (0, 7, 13, 19)}
 TOLERANCE = Decimal("0.005")
@@ -68,5 +68,71 @@ def validate_invoice(inv: InvoiceExtraction, period: str | None = None) -> list[
         code = re.sub(r"[^A-Z]", "", inv.devise.upper())
         if code not in DEVISES_DINAR:
             issues.append(Issue("devise", f"devise differente du dinar : {inv.devise}", "warning"))
+
+    return issues
+
+
+def validate_payslip(ps: PayslipExtraction, period: str | None = None) -> list[Issue]:
+    """Verifie la coherence d'un bulletin de paie.
+
+    Pas de recalcul de bareme IRPP : on lit ce qui est affiche et on cherche
+    uniquement les incoherences evidentes (montants negatifs, net > brut,
+    bulletin hors periode).
+    """
+    issues: list[Issue] = []
+
+    # 1. Champs obligatoires pour la declaration
+    for field in ("salaire_brut", "salaire_imposable", "retenue_irpp", "net_a_payer"):
+        if getattr(ps, field) is None:
+            issues.append(Issue(field, "champ manquant", "error"))
+
+    # 2. Nom et mois : souvent illisibles sur les fiches masquees/scannees
+    if ps.salarie_nom is None:
+        issues.append(Issue("salarie_nom", "nom du salarie non identifie", "warning"))
+
+    if ps.mois is None:
+        issues.append(Issue("mois", "mois du bulletin non identifie", "warning"))
+    elif period and ps.mois != period:
+        issues.append(Issue("mois", f"bulletin hors de la periode {period}", "warning"))
+
+    # 3. Coherence des montants
+    brut = _d(ps.salaire_brut)
+    imposable = _d(ps.salaire_imposable)
+    cnss = _d(ps.cnss_salariale)
+    irpp = _d(ps.retenue_irpp)
+    css = _d(ps.css)
+    net = _d(ps.net_a_payer)
+
+    if brut is not None and brut <= 0:
+        issues.append(Issue("salaire_brut", "salaire brut nul ou negatif", "error"))
+
+    if cnss is not None and brut is not None and cnss > brut:
+        issues.append(Issue("cnss_salariale", "CNSS superieure au salaire brut", "error"))
+
+    if irpp is not None and brut is not None and irpp > brut:
+        issues.append(Issue("retenue_irpp", "IRPP superieur au salaire brut", "error"))
+
+    if net is not None and brut is not None and net > brut:
+        issues.append(Issue("net_a_payer", "net a payer superieur au salaire brut", "error"))
+
+    # imposable = brut - cnss (approximation usuelle, tolerance large car primes/avantages)
+    if brut is not None and cnss is not None and imposable is not None:
+        attendu = brut - cnss
+        if abs(attendu - imposable) > Decimal("5.00"):
+            issues.append(Issue(
+                "salaire_imposable",
+                f"brut - cnss = {attendu} != imposable {imposable}",
+                "warning",
+            ))
+
+    # net = imposable - irpp - css (tolerance large : primes ajoutees apres impot)
+    if net is not None and imposable is not None and irpp is not None:
+        attendu = imposable - irpp - (css or Decimal(0))
+        if abs(attendu - net) > Decimal("5.00"):
+            issues.append(Issue(
+                "net_a_payer",
+                f"net theorique {attendu} != net affiche {net}",
+                "warning",
+            ))
 
     return issues

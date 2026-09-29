@@ -8,15 +8,16 @@ from datetime import date
 from pathlib import Path
 
 import pymupdf
+from pydantic import BaseModel
 
 from app import storage
 from app.celery_app import celery_app
 from app.config import settings
 from app.database import SessionLocal
 from app.services.document_reader import read_document
-from app.services.extraction import extract_invoice
-from app.services.schemas import InvoiceExtraction, TvaLine
-from app.services.validation import validate_invoice
+from app.services.extraction import extract_invoice, extract_payslip
+from app.services.schemas import InvoiceExtraction, PayslipExtraction, TvaLine
+from app.services.validation import validate_invoice, validate_payslip
 from app.models import Company, Document
 from app.services.classification import classify_direction
 
@@ -36,6 +37,17 @@ MOCK_INVOICE = InvoiceExtraction(
     timbre=1.0,
     total_ttc=120.0,
     devise="TND",
+)
+
+MOCK_PAYSLIP = PayslipExtraction(
+    salarie_nom="SALARIE EXEMPLE",
+    mois=date.today().strftime("%Y-%m"),
+    salaire_brut=2000.0,
+    cnss_salariale=183.6,
+    salaire_imposable=1816.4,
+    retenue_irpp=320.0,
+    css=8.3,
+    net_a_payer=1488.1,
 )
 
 # Erreurs qui valent la peine d'etre retentees : reseau, delai depasse, limite de debit, erreur serveur
@@ -71,12 +83,8 @@ def _safe_unlink(path: str) -> None:
         logger.warning("fichier temporaire non supprime : %s", path)
 
 
-def _run_extraction(doc: Document, raw: bytes) -> tuple[InvoiceExtraction, str]:
-    """Lit le document puis extrait les champs. Renvoie (champs, methode de lecture)."""
-    if settings.OCR_MOCK:
-        logger.warning("[MOCK] extraction simulee pour le document %s", doc.id)
-        return MOCK_INVOICE, "mock"
-
+def _read_pages(doc: Document, raw: bytes) -> tuple[list, str]:
+    """Ecrit le fichier dans un temp, le lit (natif ou OCR), renvoie (pages, methode)."""
     ext = Path(doc.minio_key).suffix.lower()
     tmp_path = None
     try:
@@ -94,7 +102,23 @@ def _run_extraction(doc: Document, raw: bytes) -> tuple[InvoiceExtraction, str]:
         raise ValueError("aucun texte lisible dans le document")
 
     method = "ocr" if any(p.method == "ocr" for p in pages) else "native"
-    return extract_invoice(pages), method
+    return pages, method
+
+
+def _extract_fields(doc: Document, raw: bytes) -> tuple[BaseModel, str]:
+    """Dispatch par type de document : facture ou fiche de paie."""
+    if settings.OCR_MOCK:
+        logger.warning("[MOCK] extraction simulee pour le document %s", doc.id)
+        if doc.kind == "FACTURE":
+            return MOCK_INVOICE, "mock"
+        return MOCK_PAYSLIP, "mock"
+
+    pages, method = _read_pages(doc, raw)
+    if doc.kind == "FACTURE":
+        return extract_invoice(pages), method
+    if doc.kind == "FICHE_PAIE":
+        return extract_payslip(pages), method
+    raise ValueError(f"type de document non supporte : {doc.kind}")
 
 
 @celery_app.task(
@@ -105,15 +129,18 @@ def _run_extraction(doc: Document, raw: bytes) -> tuple[InvoiceExtraction, str]:
     ignore_result=True,
 )
 def process_piece(self, document_id: int) -> None:
-    """Traite une facture : lecture, extraction, verification, statut EXTRACTED / NEEDS_REVIEW / FAILED."""
+    """Traite une piece (facture ou fiche de paie) : lecture, extraction, verification."""
     db = SessionLocal()
     try:
         doc = db.get(Document, document_id)
         if doc is None:
             logger.warning("document %s introuvable", document_id)
             return
-        if doc.kind != "FACTURE" or doc.processing_status not in ("UPLOADED", "PROCESSING"):
-            logger.info("document %s ignore (type %s, statut %s)", doc.id, doc.kind, doc.processing_status)
+        if doc.kind not in ("FACTURE", "FICHE_PAIE"):
+            logger.info("document %s ignore (type %s)", doc.id, doc.kind)
+            return
+        if doc.processing_status not in ("UPLOADED", "PROCESSING"):
+            logger.info("document %s ignore (statut %s)", doc.id, doc.processing_status)
             return
 
         doc.processing_status = "PROCESSING"
@@ -122,7 +149,7 @@ def process_piece(self, document_id: int) -> None:
 
         try:
             raw = storage.get_bytes(doc.minio_key)
-            fields, method = _run_extraction(doc, raw)
+            fields, method = _extract_fields(doc, raw)
         except Exception as exc:
             retries = self.request.retries
             transient = _is_transient(exc)
@@ -140,14 +167,21 @@ def process_piece(self, document_id: int) -> None:
 
         company = db.get(Company, doc.company_id)
         company_mf = company.matricule_fiscal if company else None
-        if method == "mock":
-            # Mode simulation : la societe est le client, pour obtenir un ACHAT coherent
-            fields = fields.model_copy(update={"client_mf": company_mf})
 
-        issues = validate_invoice(fields, doc.period)
-        direction, class_issues = classify_direction(fields.emetteur_mf, fields.client_mf, company_mf)
-        issues += class_issues
-        doc.direction = direction
+        # --- Validation et enrichissement selon le type ---
+        if doc.kind == "FACTURE":
+            # Mode simulation : la societe est le client, pour obtenir un ACHAT coherent
+            if method == "mock":
+                fields = fields.model_copy(update={"client_mf": company_mf})
+            issues = validate_invoice(fields, doc.period)
+            direction, class_issues = classify_direction(fields.emetteur_mf, fields.client_mf, company_mf)
+            issues += class_issues
+            doc.direction = direction
+        else:  # FICHE_PAIE
+            issues = validate_payslip(fields, doc.period)
+            # Pas de notion vente/achat pour une fiche de paie
+            doc.direction = None
+
         doc.extracted_data = {
             "fields": fields.model_dump(mode="json"),
             "issues": [asdict(i) for i in issues],
@@ -155,6 +189,6 @@ def process_piece(self, document_id: int) -> None:
         }
         doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
         db.commit()
-        logger.info("document %s : %s (%d alerte(s))", doc.id, doc.processing_status, len(issues))
+        logger.info("document %s (%s) : %s (%d alerte(s))", doc.id, doc.kind, doc.processing_status, len(issues))
     finally:
         db.close()
