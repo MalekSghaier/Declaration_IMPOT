@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Numeric, UniqueConstraint, func
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Index, Numeric, String, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -52,15 +52,36 @@ class RefreshToken(Base):
 
 class Document(Base):
     __tablename__ = "documents"
-    __table_args__ = (UniqueConstraint("company_id", "kind", name="uq_company_doc_kind"),)
+    __table_args__ = (
+        # Une seule patente et un seul RNE par societe
+        Index(
+            "uq_company_onboarding_kind",
+            "company_id",
+            "kind",
+            unique=True,
+            postgresql_where=text("kind IN ('PATENTE', 'RNE')"),
+        ),
+        # Un meme fichier (meme SHA-256) ne peut pas etre depose deux fois par societe
+        Index(
+            "uq_company_sha256_pieces",
+            "company_id",
+            "sha256",
+            unique=True,
+            postgresql_where=text("kind IN ('FACTURE', 'FICHE_PAIE')"),
+        ),
+        Index("ix_documents_company_period", "company_id", "period"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
-    kind: Mapped[str]  # PATENTE | RNE (FACTURE plus tard, sans contrainte unique)
+    kind: Mapped[str]  # PATENTE | RNE | FACTURE | FICHE_PAIE
     minio_key: Mapped[str]
     filename: Mapped[str]
     sha256: Mapped[str]
     extracted_data: Mapped[dict | None] = mapped_column(JSON)
+    # Onboarding : DONE... / Factures et fiches de paie : UPLOADED | EXTRACTED | NEEDS_REVIEW | VALIDATED | FAILED
     processing_status: Mapped[str] = mapped_column(default="DONE")
     error: Mapped[str | None]
+    period: Mapped[str | None] = mapped_column(String(7))  # AAAA-MM, ex. 2025-09
+    direction: Mapped[str | None]  # VENTE | ACHAT (factures uniquement)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

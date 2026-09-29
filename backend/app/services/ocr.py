@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 # minimum entre deux appels réduisent nettement les 429.
 _ocr_lock = threading.Lock()
 _last_call_at = 0.0
-MIN_INTERVAL_SECONDS = getattr(settings, "MISTRAL_OCR_MIN_INTERVAL", 1.5)
+MIN_INTERVAL_SECONDS = settings.MISTRAL_OCR_MIN_INTERVAL
 
 _client_singleton: Mistral | None = None
 _client_lock = threading.Lock()
@@ -38,18 +38,18 @@ def _client() -> Mistral:
                     server_url=settings.MISTRAL_BASE_URL,
                 )
     return _client_singleton
-    
 
-def _log_rate_limit_headers(exc_or_response, context: str) -> None:
+
+def _log_rate_limit_headers(exc: SDKError, context: str) -> None:
+    """Journalise les en-têtes de limite de débit d'une erreur, sans jamais afficher le contenu du document."""
     for attr in ("raw_response", "http_res", "response", "_raw_response"):
-        raw = getattr(exc_or_response, attr, None)
+        raw = getattr(exc, attr, None)
         if raw is not None and hasattr(raw, "headers"):
             headers = dict(raw.headers)
             interesting = {k: v for k, v in headers.items() if "ratelimit" in k.lower() or k.lower() == "retry-after"}
-            logger.info("[OCR][%s] via %s -> %s", context, attr, interesting or headers)
+            logger.info("[OCR][%s] en-tetes de limite : %s", context, interesting or "aucun")
             return
-    logger.warning("[OCR][%s] impossible de trouver l'objet réponse HTTP sur %r (attrs: %s)",
-                    context, exc_or_response, [a for a in dir(exc_or_response) if not a.startswith("__")])
+    logger.debug("[OCR][%s] pas d'en-tetes HTTP disponibles sur %s", context, type(exc).__name__)
 
 
 def _get_retry_after(exc: SDKError) -> float | None:
@@ -65,6 +65,8 @@ def _get_retry_after(exc: SDKError) -> float | None:
 
 
 def ocr_file(path: str, page_indexes: list[int] | None = None, max_retries: int = 5) -> dict[int, str]:
+    global _last_call_at
+
     p = Path(path)
     mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
     b64 = base64.b64encode(p.read_bytes()).decode()
@@ -82,14 +84,12 @@ def ocr_file(path: str, page_indexes: list[int] | None = None, max_retries: int 
     wait = 5
     for attempt in range(max_retries):
         with _ocr_lock:
-            global _last_call_at
             elapsed = time.monotonic() - _last_call_at
             if elapsed < MIN_INTERVAL_SECONDS:
                 time.sleep(MIN_INTERVAL_SECONDS - elapsed)
             try:
                 response = _client().ocr.process(**kwargs)
                 _last_call_at = time.monotonic()
-                _log_rate_limit_headers(response, context=p.name)
                 return {page.index: page.markdown for page in response.pages}
             except SDKError as exc:
                 _last_call_at = time.monotonic()

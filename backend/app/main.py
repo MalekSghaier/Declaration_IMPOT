@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app import auth,onboarding,company
+from app import auth,onboarding,company,pieces
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -17,3 +17,4 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(onboarding.router)
 app.include_router(company.router)
+app.include_router(pieces.router)

@@ -1,0 +1,30 @@
+.rv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+.rv-preview { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; height: 80vh; }
+.rv-preview img { width: 100%; height: 100%; object-fit: contain; }
+.rv-preview iframe { width: 100%; height: 100%; border: none; }
+
+.rv-form { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; }
+.rv-locked { background: #fef9c3; padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; }
+
+.rv-issues { list-style: none; padding: 0; margin: 0 0 16px; display: flex; flex-direction: column; gap: 4px; }
+.rv-issue-error { color: #991b1b; font-weight: 600; }
+.rv-issue-warning { color: #92400e; }
+
+.rv-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.rv-row label { display: flex; flex-direction: column; gap: 4px; font-size: .85rem; font-weight: 600; color: #334155; }
+.rv-row input, .rv-row select { padding: 7px 9px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
+.rv-warn input, .rv-warn select { border-color: #f59e0b; }
+.rv-error input, .rv-error select { border-color: #dc2626; }
+
+.rv-lines { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+.rv-line { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; margin-bottom: 8px; }
+.rv-line input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
+.rv-remove { background: none; border: none; color: #dc2626; cursor: pointer; font-weight: 700; }
+.rv-add { background: none; border: 1px dashed #94a3b8; border-radius: 6px; padding: 6px; cursor: pointer; width: 100%; }
+
+.rv-actions { display: flex; gap: 10px; margin-top: 10px; }
+.rv-actions button { padding: 9px 18px; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; font-weight: 600; }
+.rv-btn-primary { background: #2563eb; border-color: #2563eb; color: #43b18b; }
+.rv-btn-danger { background: #fff; border-color: #dc2626; color: #dc2626; }
+.rv-error-msg { color: #dc2626; margin-top: 10px; }
+.rv-back { display: inline-block; margin-bottom: 12px; color: #2563eb; text-decoration: none; font-weight: 600; }

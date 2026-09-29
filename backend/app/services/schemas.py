@@ -10,9 +10,9 @@ from pydantic import BaseModel, Field
 
 
 class TvaLine(BaseModel):
-    taux: Decimal
-    base_ht: Decimal
-    montant_tva: Decimal
+    taux: float
+    base_ht: float
+    montant_tva: float
 
 
 class InvoiceExtraction(BaseModel):
@@ -23,10 +23,10 @@ class InvoiceExtraction(BaseModel):
     client_nom: str | None = None
     client_mf: str | None = None
     lignes_tva: list[TvaLine] = []
-    total_ht: Decimal | None = None
-    total_tva: Decimal | None = None
-    timbre: Decimal | None = None
-    total_ttc: Decimal | None = None
+    total_ht: float | None = None
+    total_tva: float | None = None
+    timbre: float | None = None
+    total_ttc: float | None = None
     devise: str | None = None
 
 
@@ -152,7 +152,7 @@ class RNEExtraction(BaseModel):
             "IGNORE les commissaires aux comptes. "
             "Le nom peut être écrit UNIQUEMENT en arabe dans le document. Dans ce cas, "
             "translittère-le en caractères latins selon la prononciation tunisienne "
-            "(ex: صفوان قبّص → 'Safouane Guibbs'). "
+            "(ex: صفوان قبّص → 'Safouane kais'). "
             "Si tu ne peux pas translittérer de façon raisonnable, mets null."
         ),
     )
@@ -179,5 +179,5 @@ class CompanyProfile(BaseModel):
     date_creation: date | None = None
     activite: str | None = None
     dirigeant: str | None = None
-    code_tva: str | None = None          
-    code_categorie: str | None = None    
+    code_tva: str | None = None
+    code_categorie: str | None = None

@@ -24,9 +24,20 @@ class Settings(BaseSettings):
     MISTRAL_BASE_URL: str
     MISTRAL_OCR_MODEL: str
     MISTRAL_LLM_MODEL: str
+    # Delai minimum (secondes) entre deux appels OCR, pour menager la limite de debit
+    MISTRAL_OCR_MIN_INTERVAL: float
 
     # True : pas d'appel Mistral, l'extraction renvoie des donnees fictives (dev sans cle)
     OCR_MOCK: bool = False
+
+    # Depot des factures et fiches de paie
+    UPLOAD_MAX_FILE_BYTES: int
+    UPLOAD_MAX_FILES_PER_REQUEST: int
+
+    # Traitement automatique des pieces (Celery)
+    PIECES_MAX_RETRIES: int
+    PIECES_RETRY_BASE_SECONDS: int
+    PIECES_RATE_LIMIT: str
 
     JWT_SECRET: SecretStr
     ACCESS_TOKEN_MINUTES: int

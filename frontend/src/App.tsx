@@ -10,6 +10,7 @@ import Onboarding from "./Onboarding";
 import ProtectedRoute from "./ProtectedRoute";
 import RequireStatus from "./RequireStatus";
 import Accueil from "./Accueil";
+import RevueDocument from "./RevueDocument";
 
 export default function App() {
   return (
@@ -32,11 +33,13 @@ export default function App() {
                 <Route index element={<Accueil />} />
                 <Route path="info" element={<Info />} />
                 <Route path="nouveau-document" element={<NouveauDocument />} />
+                <Route path="nouveau-document/:id" element={<RevueDocument />} />
                 <Route path="mes-travaux" element={<MesTravaux />} />
               </Route>
             </Route>
 
             <Route path="*" element={<Navigate to="/" replace />} />
+            
           </Route>
         </Routes>
       </BrowserRouter>
