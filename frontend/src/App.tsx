@@ -11,6 +11,8 @@ import ProtectedRoute from "./ProtectedRoute";
 import RequireStatus from "./RequireStatus";
 import Accueil from "./Accueil";
 import RevueDocument from "./RevueDocument";
+import RevueFichePaie from "./RevueFichePaie";
+
 
 export default function App() {
   return (
@@ -35,6 +37,8 @@ export default function App() {
                 <Route path="nouveau-document" element={<NouveauDocument />} />
                 <Route path="nouveau-document/:id" element={<RevueDocument />} />
                 <Route path="mes-travaux" element={<MesTravaux />} />
+                <Route path="/dashboard/fiche-paie/:id" element={<RevueFichePaie />} />
+
               </Route>
             </Route>
 

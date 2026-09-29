@@ -229,7 +229,7 @@ function DropZone({ kind, title, hint, period, processed }: ZoneProps) {
               <ul className="nd-pieces">
                 {pieces.map((p) => (
                   <li key={p.id}>
-                    <Link to={`/dashboard/nouveau-document/${p.id}`} className="nd-piece-link">
+                    <Link to={kind === "FICHE_PAIE" ? `/dashboard/fiche-paie/${p.id}` : `/dashboard/nouveau-document/${p.id}`} className="nd-piece-link" >
                       <span className={`nd-badge nd-badge-${p.status.toLowerCase()}`}>
                         {STATUS_LABELS[p.status] ?? p.status}
                       </span>
@@ -274,7 +274,7 @@ export default function NouveauDocument() {
           title="Fiches de paie"
           hint="PDF, PNG ou JPG"
           period={period}
-          processed={false}
+          processed
         />
       </div>
     </>

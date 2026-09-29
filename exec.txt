@@ -5,3 +5,7 @@ set MINIO_ROOT_USER=minioadmin
 set MINIO_ROOT_PASSWORD=minioadmin        
 
 C:\minio\minio.exe server C:\minio-data --console-address ":9001"
+
+celery -A app.celery_app worker --pool=solo --loglevel=info
+
+uvicorn app.main:app --reload --port 8000
