@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import random
@@ -182,11 +183,14 @@ def process_piece(self, document_id: int) -> None:
             # Pas de notion vente/achat pour une fiche de paie
             doc.direction = None
 
-        doc.extracted_data = {
+        payload = {
             "fields": fields.model_dump(mode="json"),
             "issues": [asdict(i) for i in issues],
             "method": method,
         }
+        doc.extracted_data = payload
+        # Copie figee de la sortie automatique : la revue humaine ne la modifie jamais
+        doc.original_data = copy.deepcopy(payload)
         doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
         db.commit()
         logger.info("document %s (%s) : %s (%d alerte(s))", doc.id, doc.kind, doc.processing_status, len(issues))

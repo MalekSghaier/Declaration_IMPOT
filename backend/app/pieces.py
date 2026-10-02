@@ -25,6 +25,7 @@ from app.services.schemas import InvoiceExtraction, PayslipExtraction
 from app.services.validation import validate_invoice, validate_payslip
 from app.tasks import process_piece
 from typing import Any, Literal, Union
+from app.audit import diff_fields, log_action
 
 
 logger = logging.getLogger("app.pieces")
@@ -323,8 +324,24 @@ def review_piece(
     if doc.processing_status in ("UPLOADED", "PROCESSING"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Traitement automatique pas encore termine")
 
+    # Etat avant modification : sert de reference pour l'audit
+    old_fields = (doc.extracted_data or {}).get("fields") or {}
+    old_direction = doc.direction
+
+    def audit_corrections(new_fields: dict) -> None:
+        for field, old, new in diff_fields(old_fields, new_fields):
+            log_action(
+                db, doc.company_id, user.id, "PIECE_CORRIGEE", "document", doc.id,
+                field=field, old=old, new=new,
+            )
+
     # ---------- Rejet : commun aux deux types ----------
     if body.action == "reject":
+        audit_corrections(body.fields)
+        log_action(
+            db, doc.company_id, user.id, "PIECE_REJETEE", "document", doc.id,
+            reason=body.reject_reason,
+        )
         doc.processing_status = "REJECTED"
         doc.extracted_data = {
             **(doc.extracted_data or {}),
@@ -366,11 +383,6 @@ def review_piece(
             doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
 
         doc.direction = direction
-        doc.extracted_data = {
-            "fields": fields.model_dump(mode="json"),
-            "issues": [asdict(i) for i in issues],
-            "method": (doc.extracted_data or {}).get("method"),
-        }
 
     elif doc.kind == "FICHE_PAIE":
         try:
@@ -392,14 +404,27 @@ def review_piece(
             doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
 
         doc.direction = None  # pas de notion vente/achat pour une fiche de paie
-        doc.extracted_data = {
-            "fields": fields.model_dump(mode="json"),
-            "issues": [asdict(i) for i in issues],
-            "method": (doc.extracted_data or {}).get("method"),
-        }
 
     else:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Type de piece non supporte : {doc.kind}")
+
+    new_fields = fields.model_dump(mode="json")
+
+    # ---------- Audit : ecrit seulement si toutes les verifications ont passe ----------
+    audit_corrections(new_fields)
+    if doc.kind == "FACTURE" and body.direction and body.direction != old_direction:
+        log_action(
+            db, doc.company_id, user.id, "PIECE_CORRIGEE", "document", doc.id,
+            field="direction", old=old_direction, new=body.direction,
+        )
+    if body.action == "validate":
+        log_action(db, doc.company_id, user.id, "PIECE_VALIDEE", "document", doc.id)
+
+    doc.extracted_data = {
+        "fields": new_fields,
+        "issues": [asdict(i) for i in issues],
+        "method": (doc.extracted_data or {}).get("method"),
+    }
 
     db.commit()
     return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)

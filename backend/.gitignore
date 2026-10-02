@@ -30,3 +30,7 @@ samples/
 # Node
 node_modules/
 dist/
+
+
+#tests
+tests/

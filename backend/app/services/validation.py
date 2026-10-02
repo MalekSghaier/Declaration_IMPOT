@@ -7,8 +7,7 @@ from app.services.schemas import InvoiceExtraction, PayslipExtraction
 TAUX_VALIDES = {Decimal(x) for x in (0, 7, 13, 19)}
 TOLERANCE = Decimal("0.005")
 DEVISES_DINAR = {"TND", "DT", "DINAR", "DINARS"}
-# A affiner avec vos vrais documents
-MF_REGEX = re.compile(r"^\d{7}\s*[A-Z](\s*/\s*[A-Z]\s*/\s*[A-Z]\s*/\s*\d{3})?$")
+MF_REGEX = re.compile(r"^\d{7,8}\s*/?\s*[A-Z](\s*/\s*[A-Z]){0,2}(\s*/\s*\d{3})?$")
 
 
 @dataclass
