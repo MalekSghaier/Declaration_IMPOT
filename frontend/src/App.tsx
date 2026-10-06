@@ -12,6 +12,7 @@ import RequireStatus from "./RequireStatus";
 import Accueil from "./Accueil";
 import RevueDocument from "./RevueDocument";
 import RevueFichePaie from "./RevueFichePaie";
+import PeriodesFiscales from "./PeriodesFiscales";
 
 
 export default function App() {
@@ -38,6 +39,7 @@ export default function App() {
                 <Route path="nouveau-document/:id" element={<RevueDocument />} />
                 <Route path="mes-travaux" element={<MesTravaux />} />
                 <Route path="/dashboard/fiche-paie/:id" element={<RevueFichePaie />} />
+                <Route path="periodes" element={<PeriodesFiscales />} />
 
               </Route>
             </Route>

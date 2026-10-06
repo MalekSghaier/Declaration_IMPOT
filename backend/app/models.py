@@ -87,6 +87,7 @@ class Document(Base):
             postgresql_where=text("kind IN ('FACTURE', 'FICHE_PAIE')"),
         ),
         Index("ix_documents_company_period", "company_id", "period"),
+        Index("ix_documents_tax_period", "tax_period_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -104,6 +105,7 @@ class Document(Base):
     error: Mapped[str | None]
     period: Mapped[str | None] = mapped_column(String(7))  # AAAA-MM, ex. 2025-09
     direction: Mapped[str | None]  # VENTE | ACHAT (factures uniquement)
+    tax_period_id: Mapped[int | None] = mapped_column(ForeignKey("tax_periods.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -325,3 +327,32 @@ class Establishment(Base):
     reason: Mapped[str | None]
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TaxPeriod(Base):
+    """Periode fiscale d'un contribuable : le conteneur temporel des donnees futures.
+
+    period_type : MONTH | QUARTER | YEAR (constantes du service, pas de table de reference).
+    period_end est INCLUSIVE (01/09 -> 30/09), contrairement aux periodes de validite
+    [valid_from, valid_to[ des autres tables.
+    status : OPEN | DOCUMENTS_IN_PROGRESS | CALCULATED | READY_FOR_REVIEW | VALIDATED | FINALIZED | ARCHIVED.
+    Unicite : un contribuable ne peut avoir qu'une periode par (type, debut).
+    """
+
+    __tablename__ = "tax_periods"
+    __table_args__ = (
+        UniqueConstraint("company_id", "period_type", "period_start", name="uq_tax_period_company_type_start"),
+        CheckConstraint("period_end >= period_start", name="ck_tax_period_dates"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), nullable=False)
+    period_type: Mapped[str] = mapped_column(String(20))
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default="OPEN", server_default="OPEN")
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

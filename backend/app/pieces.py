@@ -19,13 +19,16 @@ from app import storage
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user
-from app.models import Company, Document, User
+from app.models import Company, Document, TaxPeriod, User
 from app.services.classification import classify_direction
 from app.services.schemas import InvoiceExtraction, PayslipExtraction
 from app.services.validation import validate_invoice, validate_payslip
 from app.tasks import process_piece
 from typing import Any, Literal, Union
 from app.audit import diff_fields, log_action
+from app.intervals import StructureError
+from app.tax_period_service import assert_accepts_documents, get_or_create_month
+from app.tax_periods import to_http
 
 
 logger = logging.getLogger("app.pieces")
@@ -34,7 +37,7 @@ router = APIRouter(prefix="/api/pieces", tags=["pieces"])
 
 KINDS = ("FACTURE", "FICHE_PAIE")
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
-PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")  # AAAA-MM
+PERIOD_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")  # AAAA-MM, chiffres ASCII uniquement
 STATUSES = ("UPLOADED", "PROCESSING", "EXTRACTED", "NEEDS_REVIEW", "VALIDATED", "REJECTED", "FAILED")
 
 
@@ -59,6 +62,7 @@ class PieceOut(BaseModel):
     period: str | None
     direction: str | None
     status: str
+    tax_period_id: int | None = None
     created_at: datetime
 
 
@@ -92,6 +96,7 @@ def _to_piece_out(d: Document) -> dict:
         "period": d.period,
         "direction": d.direction,
         "status": d.processing_status,
+        "tax_period_id": d.tax_period_id,
         "created_at": d.created_at,
     }
 
@@ -125,7 +130,7 @@ def _enqueue(document_id: int) -> None:
         logger.exception("mise en file impossible pour le document %s (reste UPLOADED)", document_id)
 
 
-def _store_one(company_id: int, kind: str, period: str, upload: UploadFile, db: Session) -> FileResult:
+def _store_one( company_id: int, kind: str, period: str, tax_period_id: int, upload: UploadFile, db: Session) -> FileResult:
     name = Path(upload.filename or "sans_nom").name[:255]
 
     def rejected(reason: str) -> FileResult:
@@ -167,6 +172,7 @@ def _store_one(company_id: int, kind: str, period: str, upload: UploadFile, db: 
         sha256=sha256,
         processing_status="UPLOADED",
         period=period,
+        tax_period_id=tax_period_id,
     )
     db.add(doc)
     try:
@@ -204,13 +210,21 @@ def upload(
     company = db.get(Company, user.company_id)
     if company.status != "LOCKED":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Terminez d'abord l'onboarding de la societe")
+    try:
+        tax_period = get_or_create_month(db, user.company_id, period, user.id, reason="DEPOT_DOCUMENT")
+        assert_accepts_documents(tax_period)
+        tax_period_id = tax_period.id
+        db.commit()
+    except StructureError as exc:
+        db.rollback()
+        raise to_http(exc)
 
-    results = [_store_one(user.company_id, kind, period, f, db) for f in files]
+    results = [_store_one(user.company_id, kind, period, tax_period_id, f, db) for f in files]
     return UploadOut(
-        accepted=sum(r.status == "accepted" for r in results),
-        duplicates=sum(r.status == "duplicate" for r in results),
-        rejected=sum(r.status == "rejected" for r in results),
-        results=results,
+    accepted=sum(r.status == "accepted" for r in results),
+    duplicates=sum(r.status == "duplicate" for r in results),
+    rejected=sum(r.status == "rejected" for r in results),
+    results=results,
     )
 
 
@@ -425,6 +439,19 @@ def review_piece(
         "issues": [asdict(i) for i in issues],
         "method": (doc.extracted_data or {}).get("method"),
     }
-
+    
+    # Une période passe de OPEN à DOCUMENTS_IN_PROGRESS
+    # lorsqu'au moins un document de cette période est validé.
+    if body.action == "validate" and doc.tax_period_id is not None:
+        tax_period = db.get(TaxPeriod, doc.tax_period_id)
+    
+        if tax_period is not None and tax_period.status == "OPEN":
+            tax_period.status = "DOCUMENTS_IN_PROGRESS"
+    
     db.commit()
-    return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)
+    
+    return PieceDetailOut(
+        **_to_piece_out(doc),
+        error=doc.error,
+        extracted_data=doc.extracted_data,
+    )

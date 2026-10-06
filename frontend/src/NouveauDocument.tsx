@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { DragEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { api } from "./api";
 import "./NouveauDocument.css";
@@ -19,6 +19,7 @@ type Report = { accepted: number; duplicates: number; rejected: number; problems
 type Piece = { id: number; filename: string; direction: string | null; status: string };
 
 const BATCH_SIZE = 20;
+const MONTH_RE = /^[0-9]{4}-(0[1-9]|1[0-2])$/;
 const POLL_MS = 2000;
 const MAX_PROBLEMS_SHOWN = 50;
 const MAX_PIECES_SHOWN = 100;
@@ -229,7 +230,7 @@ function DropZone({ kind, title, hint, period, processed }: ZoneProps) {
               <ul className="nd-pieces">
                 {pieces.map((p) => (
                   <li key={p.id}>
-                    <Link to={kind === "FICHE_PAIE" ? `/dashboard/fiche-paie/${p.id}` : `/dashboard/nouveau-document/${p.id}`} className="nd-piece-link" >
+                    <Link to={kind === "FICHE_PAIE" ? `/dashboard/fiche-paie/${p.id}?period=${period}` : `/dashboard/nouveau-document/${p.id}?period=${period}`} className="nd-piece-link" >
                       <span className={`nd-badge nd-badge-${p.status.toLowerCase()}`}>
                         {STATUS_LABELS[p.status] ?? p.status}
                       </span>
@@ -253,7 +254,9 @@ function DropZone({ kind, title, hint, period, processed }: ZoneProps) {
 }
 
 export default function NouveauDocument() {
-  const [period, setPeriod] = useState(currentMonth());
+  const [params] = useSearchParams();
+  const requested = params.get("period") ?? "";
+  const [period, setPeriod] = useState(MONTH_RE.test(requested) ? requested : currentMonth());
 
   return (
     <>

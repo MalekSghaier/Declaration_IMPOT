@@ -34,7 +34,7 @@ def validate_invoice(inv: InvoiceExtraction, period: str | None = None) -> list[
             issues.append(Issue(field, "champ manquant", "error"))
 
     if inv.date_facture is not None and period and inv.date_facture.strftime("%Y-%m") != period:
-        issues.append(Issue("date_facture", f"date hors de la periode {period}", "warning"))
+        issues.append(Issue("date_facture", f"date hors de la periode {period}", "error"))
 
     total_ht, total_tva, total_ttc, timbre = _d(inv.total_ht), _d(inv.total_tva), _d(inv.total_ttc), _d(inv.timbre)
 
@@ -92,7 +92,7 @@ def validate_payslip(ps: PayslipExtraction, period: str | None = None) -> list[I
     if ps.mois is None:
         issues.append(Issue("mois", "mois du bulletin non identifie", "warning"))
     elif period and ps.mois != period:
-        issues.append(Issue("mois", f"bulletin hors de la periode {period}", "warning"))
+        issues.append(Issue("mois", f"bulletin hors de la periode {period}", "error"))
 
     # 3. Coherence des montants
     brut = _d(ps.salaire_brut)

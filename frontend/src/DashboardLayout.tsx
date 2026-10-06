@@ -5,6 +5,7 @@ import "./DashboardLayout.css";
 const LINKS = [
   { to: "/dashboard", label: "Accueil", end: true },
   { to: "/dashboard/info", label: "Info", end: false },
+  { to: "/dashboard/periodes", label: "Périodes fiscales", end: false },
   { to: "/dashboard/nouveau-document", label: "Nouveau document", end: false },
   { to: "/dashboard/mes-travaux", label: "Mes travaux", end: false },
 ];
