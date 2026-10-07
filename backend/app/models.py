@@ -1,12 +1,12 @@
 from datetime import date, datetime
 from decimal import Decimal
-
 from sqlalchemy import (
     JSON,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Numeric,
     String,
@@ -78,6 +78,7 @@ class Document(Base):
             unique=True,
             postgresql_where=text("kind IN ('PATENTE', 'RNE')"),
         ),
+        UniqueConstraint("id", "company_id", name="uq_documents_id_company"),
         # Un meme fichier (meme SHA-256) ne peut pas etre depose deux fois par societe
         Index(
             "uq_company_sha256_pieces",
@@ -343,6 +344,7 @@ class TaxPeriod(Base):
     __table_args__ = (
         UniqueConstraint("company_id", "period_type", "period_start", name="uq_tax_period_company_type_start"),
         CheckConstraint("period_end >= period_start", name="ck_tax_period_dates"),
+        UniqueConstraint("id", "company_id", name="uq_tax_periods_id_company"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -356,3 +358,112 @@ class TaxPeriod(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class DocumentSnapshot(Base):
+    """Version immuable d'une piece validee.
+
+    Un seul snapshot CURRENT par document (index unique partiel). Les faits normalises d'un snapshot
+    ne sont jamais modifies : une nouvelle validation avec d'autres valeurs cree une nouvelle version.
+    Les cles composites interdisent qu'un snapshot melange la societe du document et celle de la periode.
+    status : CURRENT | SUPERSEDED (remplace sans interruption) | WITHDRAWN (piece sortie de VALIDATED).
+    """
+
+    __tablename__ = "document_snapshots"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "company_id"], ["documents.id", "documents.company_id"], name="fk_snapshot_document"
+        ),
+        ForeignKeyConstraint(
+            ["tax_period_id", "company_id"], ["tax_periods.id", "tax_periods.company_id"], name="fk_snapshot_tax_period"
+        ),
+        UniqueConstraint("document_id", "version", name="uq_snapshot_document_version"),
+        CheckConstraint("status IN ('CURRENT', 'SUPERSEDED', 'WITHDRAWN')", name="ck_snapshot_status"),
+        CheckConstraint("origin IN ('REVIEW', 'BACKFILL')", name="ck_snapshot_origin"),
+        CheckConstraint("version >= 1", name="ck_snapshot_version"),
+        CheckConstraint(
+            "(status = 'CURRENT' AND closed_at IS NULL) OR (status <> 'CURRENT' AND closed_at IS NOT NULL)",
+            name="ck_snapshot_closure",
+        ),
+        Index(
+            "uq_snapshot_current_per_document",
+            "document_id",
+            unique=True,
+            postgresql_where=text("status = 'CURRENT'"),
+            sqlite_where=text("status = 'CURRENT'"),
+        ),
+        Index(
+            "ix_snapshots_company_period_current",
+            "company_id",
+            "tax_period_id",
+            postgresql_where=text("status = 'CURRENT'"),
+            sqlite_where=text("status = 'CURRENT'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int]
+    company_id: Mapped[int]
+    tax_period_id: Mapped[int | None]
+    kind: Mapped[str] = mapped_column(String(30))
+    direction: Mapped[str | None] = mapped_column(String(10))
+    version: Mapped[int]
+    status: Mapped[str] = mapped_column(String(12))
+    validated_fields: Mapped[dict] = mapped_column(JSON)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    normalizer_version: Mapped[str] = mapped_column(String(20))
+    extraction_method: Mapped[str | None] = mapped_column(String(20))
+    issues: Mapped[list | None] = mapped_column(JSON)
+    origin: Mapped[str] = mapped_column(String(12))
+    validated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    closed_reason: Mapped[str | None] = mapped_column(String(40))
+
+
+class SnapshotFact(Base):
+    """Fait normalise et type d'un snapshot. Table generique : aucune colonne propre a un type de piece.
+
+    collection '' = en-tete du document ; 'lignes_tva'... = lignes repetitives (item_index = rang).
+    Une seule colonne value_* est renseignee, selon value_type, et seulement si reliability = RELIABLE :
+    un fait UNRELIABLE ou ABSENT ne porte AUCUNE valeur (contrainte en base). ABSENT n'est jamais zero.
+    value_decimal : NUMERIC sans echelle imposee (aucun arrondi a l'etape 5).
+    raw_value : valeur validee telle que lue a source_path dans document_snapshots.validated_fields.
+    """
+
+    __tablename__ = "snapshot_facts"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "collection", "item_index", "fact_code", name="uq_snapshot_fact_key"),
+        CheckConstraint("reliability IN ('RELIABLE', 'UNRELIABLE', 'ABSENT')", name="ck_fact_reliability"),
+        CheckConstraint(
+            "value_type IN ('AMOUNT', 'RATE', 'DATE', 'MONTH', 'TEXT', 'CODE')", name="ck_fact_value_type"
+        ),
+        CheckConstraint("item_index >= 0", name="ck_fact_index"),
+        CheckConstraint("reliability <> 'UNRELIABLE' OR reason_code IS NOT NULL", name="ck_fact_reason"),
+        CheckConstraint(
+            "(reliability <> 'RELIABLE' AND value_decimal IS NULL AND value_date IS NULL AND value_text IS NULL)"
+            " OR (reliability = 'RELIABLE' AND ("
+            "(value_type IN ('AMOUNT', 'RATE') AND value_decimal IS NOT NULL AND value_date IS NULL AND value_text IS NULL)"
+            " OR (value_type IN ('DATE', 'MONTH') AND value_date IS NOT NULL AND value_decimal IS NULL AND value_text IS NULL)"
+            " OR (value_type IN ('TEXT', 'CODE') AND value_text IS NOT NULL AND value_decimal IS NULL AND value_date IS NULL)"
+            "))",
+            name="ck_fact_value_consistency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("document_snapshots.id"))
+    collection: Mapped[str] = mapped_column(String(40))
+    item_index: Mapped[int]
+    fact_code: Mapped[str] = mapped_column(String(64))
+    value_type: Mapped[str] = mapped_column(String(10))
+    value_decimal: Mapped[Decimal | None] = mapped_column(Numeric())
+    value_date: Mapped[date | None] = mapped_column(Date)
+    value_text: Mapped[str | None]
+    unit: Mapped[str | None] = mapped_column(String(10))
+    reliability: Mapped[str] = mapped_column(String(12))
+    reason_code: Mapped[str | None] = mapped_column(String(40))
+    raw_value: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON)
+    source_path: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

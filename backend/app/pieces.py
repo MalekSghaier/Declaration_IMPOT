@@ -29,7 +29,7 @@ from app.audit import diff_fields, log_action
 from app.intervals import StructureError
 from app.tax_period_service import assert_accepts_documents, get_or_create_month
 from app.tax_periods import to_http
-
+from app.snapshots import audit_payload, create_or_confirm_snapshot, withdraw_current
 
 logger = logging.getLogger("app.pieces")
 
@@ -331,7 +331,7 @@ def review_piece(
             Document.id == piece_id,
             Document.company_id == user.company_id,
             Document.kind.in_(KINDS),
-        )
+        ).with_for_update()
     )
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Piece non trouvee")
@@ -356,6 +356,7 @@ def review_piece(
             db, doc.company_id, user.id, "PIECE_REJETEE", "document", doc.id,
             reason=body.reject_reason,
         )
+        withdraw_current(db, doc, user.id, "REOPENED_REJECT")
         doc.processing_status = "REJECTED"
         doc.extracted_data = {
             **(doc.extracted_data or {}),
@@ -423,6 +424,8 @@ def review_piece(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Type de piece non supporte : {doc.kind}")
 
     new_fields = fields.model_dump(mode="json")
+    issues_payload = [asdict(i) for i in issues]
+    method = (doc.extracted_data or {}).get("method")
 
     # ---------- Audit : ecrit seulement si toutes les verifications ont passe ----------
     audit_corrections(new_fields)
@@ -431,27 +434,43 @@ def review_piece(
             db, doc.company_id, user.id, "PIECE_CORRIGEE", "document", doc.id,
             field="direction", old=old_direction, new=body.direction,
         )
+
     if body.action == "validate":
-        log_action(db, doc.company_id, user.id, "PIECE_VALIDEE", "document", doc.id)
+        # Version immuable de la piece validee, puis audit avec les champs valides (D2)
+        try:
+            result = create_or_confirm_snapshot(
+                db, doc, new_fields, user.id, extraction_method=method, issues=issues_payload
+            )
+        except StructureError as exc:
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+        log_action(
+            db, doc.company_id, user.id, "PIECE_VALIDEE", "document", doc.id,
+            new=audit_payload(result, new_fields),
+        )
+    else:
+        # La piece n'est plus VALIDATED : sa version validee n'est plus valable
+        withdraw_current(db, doc, user.id, "REOPENED_SAVE")
 
     doc.extracted_data = {
         "fields": new_fields,
-        "issues": [asdict(i) for i in issues],
-        "method": (doc.extracted_data or {}).get("method"),
+        "issues": issues_payload,
+        "method": method,
     }
-    
+
     # Une période passe de OPEN à DOCUMENTS_IN_PROGRESS
     # lorsqu'au moins un document de cette période est validé.
     if body.action == "validate" and doc.tax_period_id is not None:
         tax_period = db.get(TaxPeriod, doc.tax_period_id)
-    
+
         if tax_period is not None and tax_period.status == "OPEN":
             tax_period.status = "DOCUMENTS_IN_PROGRESS"
-    
+
     db.commit()
-    
+
     return PieceDetailOut(
         **_to_piece_out(doc),
         error=doc.error,
         extracted_data=doc.extracted_data,
     )
+    
