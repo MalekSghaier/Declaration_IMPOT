@@ -7,6 +7,9 @@ Un snapshot est immuable. Cycle de vie (meme transaction que la piece et l'audit
 - piece sortie de VALIDATED (save, reject)   -> le CURRENT devient WITHDRAWN.
 Invariant : un CURRENT existe si et seulement si la piece est VALIDATED.
 Pas de commit ici (a l'appelant). Le backfill utilise exactement les memes fonctions.
+
+La devise est resolue ici (liste de reference CURRENCY, via une Session) puis transmise au normaliseur,
+qui reste pur. Devise inconnue ou ambigue : fail closed (voir app.normalization).
 """
 import hashlib
 import json
@@ -21,11 +24,21 @@ from sqlalchemy.orm import Session
 from app.audit import log_action
 from app.intervals import StructureError
 from app.models import Document, DocumentSnapshot, SnapshotFact
-from app.normalization import CATALOG, NORMALIZER_VERSION, normalize_document
+from app.normalization import (
+    CATALOG,
+    NORMALIZER_VERSION,
+    RELIABLE,
+    UNRELIABLE,
+    Parsed,
+    currency_inputs,
+    normalize_document,
+)
+from app.reference import ReferenceAmbiguous, resolve_reference
 from app.services.schemas import InvoiceExtraction, PayslipExtraction
 
 ORIGINS = ("REVIEW", "BACKFILL")
 SCHEMAS = {"FACTURE": InvoiceExtraction, "FICHE_PAIE": PayslipExtraction}
+CURRENCY_CATEGORY = "CURRENCY"
 
 
 @dataclass
@@ -74,6 +87,24 @@ def current_snapshot(db: Session, document_id: int, company_id: int) -> Document
         )
     )
 
+def is_stale(snapshot: DocumentSnapshot) -> bool:
+    """Vrai si le snapshot a ete produit par une autre version du normaliseur que la version courante.
+    Ne modifie rien : l'historique n'est jamais reecrit automatiquement (D3)."""
+    return snapshot.normalizer_version != NORMALIZER_VERSION
+
+
+def stale_snapshots(db: Session, company_id: int, tax_period_id: int | None = None) -> list[DocumentSnapshot]:
+    """Snapshots CURRENT d'une societe (et d'une periode si precisee) produits par un autre normaliseur."""
+    stmt = select(DocumentSnapshot).where(
+        DocumentSnapshot.company_id == company_id,
+        DocumentSnapshot.status == "CURRENT",
+        DocumentSnapshot.normalizer_version != NORMALIZER_VERSION,
+    )
+    if tax_period_id is not None:
+        stmt = stmt.where(DocumentSnapshot.tax_period_id == tax_period_id)
+    return list(db.scalars(stmt.order_by(DocumentSnapshot.document_id)))
+
+
 
 def list_snapshots(db: Session, company_id: int, document_id: int) -> list[DocumentSnapshot]:
     doc = get_document(db, company_id, document_id)
@@ -84,6 +115,27 @@ def list_snapshots(db: Session, company_id: int, document_id: int) -> list[Docum
             .order_by(DocumentSnapshot.version)
         )
     )
+
+
+def resolve_currencies(db: Session, kind: str, fields: dict) -> dict[str, Parsed]:
+    """Resout les devises d'une piece via la liste de reference CURRENCY : {fact_code: Parsed}.
+    Devise absente : aucune entree (rien a resoudre). Inconnue ou ambigue : UNRELIABLE (fail closed).
+    Aucun code de devise n'est connu ici : tout vient de reference_values."""
+    resolved: dict[str, Parsed] = {}
+    for code, raw in currency_inputs(kind, fields).items():
+        if not isinstance(raw, str):
+            resolved[code] = Parsed(UNRELIABLE, "NOT_TEXT")
+            continue
+        try:
+            ref = resolve_reference(db, CURRENCY_CATEGORY, raw)
+        except ReferenceAmbiguous:
+            resolved[code] = Parsed(UNRELIABLE, "CURRENCY_AMBIGUOUS")
+            continue
+        if ref is None:
+            resolved[code] = Parsed(UNRELIABLE, "CURRENCY_UNKNOWN")
+        else:
+            resolved[code] = Parsed(RELIABLE, value_text=ref.code)
+    return resolved
 
 
 def create_or_confirm_snapshot(
@@ -113,6 +165,8 @@ def create_or_confirm_snapshot(
     current = current_snapshot(db, doc.id, doc.company_id)
     if current is not None and current.fingerprint == fingerprint:
         return SnapshotResult(current, created=False)
+
+    resolved = resolve_currencies(db, doc.kind, encoded)
 
     now = datetime.now(timezone.utc)
     try:
@@ -146,7 +200,7 @@ def create_or_confirm_snapshot(
             )
             db.add(snapshot)
             db.flush()
-            for fact in normalize_document(doc.kind, encoded):
+            for fact in normalize_document(doc.kind, encoded, resolved=resolved):
                 db.add(
                     SnapshotFact(
                         snapshot_id=snapshot.id,

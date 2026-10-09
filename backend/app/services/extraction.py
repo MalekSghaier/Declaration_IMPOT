@@ -93,6 +93,7 @@ Regles :
 - Si une information est absente ou illisible, mets null. N'invente jamais de valeur.
 - Le matricule fiscal est recopie tel quel.
 - Une ligne dans lignes_tva par taux de TVA distinct.
+- Si le taux, la base HT ou le montant TVA d'une ligne est illisible ou absent, mets null. Ne mets jamais 0 pour une valeur que tu ne lis pas.
 - Distingue bien l'emetteur (vendeur) du client."""
 
 PATENTE_SYSTEM = """Tu extrais les informations d'une carte d'identification fiscale tunisienne (patente).

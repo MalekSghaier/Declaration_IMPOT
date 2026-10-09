@@ -8,13 +8,15 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import Document, DocumentSnapshot
-from app.normalization import CATALOG
+from app.normalization import CATALOG, NORMALIZER_VERSION
 from app.snapshots import canonical_fields, compute_fingerprint
 from app.intervals import StructureError
+from app.snapshots import is_stale
 
 
 def main() -> None:
     problems = 0
+    stale    = 0
     with SessionLocal() as db:
         docs = db.scalars(select(Document).where(Document.kind.in_(tuple(CATALOG))).order_by(Document.id)).all()
         current = {s.document_id: s for s in db.scalars(select(DocumentSnapshot).where(DocumentSnapshot.status == "CURRENT"))}
@@ -34,6 +36,9 @@ def main() -> None:
                     print(f"CHAMPS ILLISIBLES doc={doc.id}")
                     problems += 1
                     continue
+                if is_stale(snap):
+                    print(f"STALE          doc={doc.id} (normaliseur {snap.normalizer_version}, courant {NORMALIZER_VERSION})")
+                    stale += 1
                 if snap.fingerprint != compute_fingerprint(doc.kind, doc.direction, doc.tax_period_id, fields):
                     print(f"DIVERGENT      doc={doc.id} (empreinte differente)")
                     problems += 1
@@ -43,8 +48,12 @@ def main() -> None:
         for document_id in current:
             print(f"ORPHELIN       snapshot CURRENT sans piece de pieces periodiques : doc={document_id}")
             problems += 1
-    print("OK : aucun probleme" if problems == 0 else f"{problems} point(s) a verifier")
-
+    if problems:
+        print(f"{problems} point(s) a verifier")
+    elif stale:
+        print(f"Aucune incoherence ; {stale} snapshot(s) STALE (a rafraichir avant l'etape 7)")
+    else:
+        print("OK : aucun probleme")
 
 if __name__ == "__main__":
     main()

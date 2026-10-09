@@ -79,6 +79,13 @@ class Document(Base):
             postgresql_where=text("kind IN ('PATENTE', 'RNE')"),
         ),
         UniqueConstraint("id", "company_id", name="uq_documents_id_company"),
+        # La periode fiscale d'une piece appartient a la meme societe que la piece
+        # (tax_period_id NULL : aucun controle, une piece peut ne pas avoir de periode)
+        ForeignKeyConstraint(
+            ["tax_period_id", "company_id"],
+            ["tax_periods.id", "tax_periods.company_id"],
+            name="fk_documents_tax_period",
+        ),
         # Un meme fichier (meme SHA-256) ne peut pas etre depose deux fois par societe
         Index(
             "uq_company_sha256_pieces",
@@ -106,7 +113,8 @@ class Document(Base):
     error: Mapped[str | None]
     period: Mapped[str | None] = mapped_column(String(7))  # AAAA-MM, ex. 2025-09
     direction: Mapped[str | None]  # VENTE | ACHAT (factures uniquement)
-    tax_period_id: Mapped[int | None] = mapped_column(ForeignKey("tax_periods.id"))
+    # FK composite (tax_period_id, company_id) -> tax_periods : voir __table_args__
+    tax_period_id: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -4,7 +4,7 @@ import axios from "axios";
 import { api, fetchFileBlobUrl } from "./api";
 import "./RevueDocument.css";
 
-type TvaLine = { taux: number; base_ht: number; montant_tva: number };
+type TvaLine = { taux: number | null; base_ht: number | null; montant_tva: number | null };
 type Fields = {
   numero: string | null;
   date_facture: string | null;
@@ -95,14 +95,14 @@ export default function RevueDocument() {
   const setField = <K extends keyof Fields>(key: K, value: Fields[K]) =>
     setFields((f) => ({ ...f, [key]: value }));
 
-  const setLine = (i: number, key: keyof TvaLine, value: number) =>
+  const setLine = (i: number, key: keyof TvaLine, value: number | null) =>
     setFields((f) => ({
       ...f,
       lignes_tva: f.lignes_tva.map((l, idx) => (idx === i ? { ...l, [key]: value } : l)),
     }));
 
   const addLine = () =>
-    setFields((f) => ({ ...f, lignes_tva: [...f.lignes_tva, { taux: 19, base_ht: 0, montant_tva: 0 }] }));
+    setFields((f) => ({ ...f, lignes_tva: [...f.lignes_tva, { taux: null, base_ht: null, montant_tva: null }] }));
 
   const removeLine = (i: number) =>
     setFields((f) => ({ ...f, lignes_tva: f.lignes_tva.filter((_, idx) => idx !== i) }));
@@ -203,9 +203,9 @@ export default function RevueDocument() {
             <legend>Lignes de TVA</legend>
             {fields.lignes_tva.map((l, i) => (
               <div className="rv-line" key={i}>
-                <input type="number" value={l.taux} disabled={locked} onChange={(e) => setLine(i, "taux", num(e.target.value) ?? 0)} placeholder="Taux %" />
-                <input type="number" value={l.base_ht} disabled={locked} onChange={(e) => setLine(i, "base_ht", num(e.target.value) ?? 0)} placeholder="Base HT" />
-                <input type="number" value={l.montant_tva} disabled={locked} onChange={(e) => setLine(i, "montant_tva", num(e.target.value) ?? 0)} placeholder="Montant TVA" />
+                <input type="number" value={l.taux ?? ""} disabled={locked} onChange={(e) => setLine(i, "taux", num(e.target.value))} placeholder="Taux %" />
+                <input type="number" value={l.base_ht ?? ""} disabled={locked} onChange={(e) => setLine(i, "base_ht", num(e.target.value))} placeholder="Base HT" />
+                <input type="number" value={l.montant_tva ?? ""} disabled={locked} onChange={(e) => setLine(i, "montant_tva", num(e.target.value))} placeholder="Montant TVA" />
                 {!locked && (
                   <button type="button" className="rv-remove" onClick={() => removeLine(i)}>
                     ✕

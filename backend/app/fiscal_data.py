@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.intervals import StructureError
 from app.models import Document, DocumentSnapshot, SnapshotFact, TaxPeriod
-from app.normalization import CATALOG
-from app.snapshots import current_snapshot, get_document
+from app.normalization import CATALOG, NORMALIZER_VERSION
+from app.snapshots import current_snapshot, get_document, is_stale
 
 
 @dataclass(frozen=True)
@@ -41,19 +41,44 @@ class FactView:
     source_path: str
 
 
+@dataclass(frozen=True)
+class MissingFact:
+    """Fait attendu par le catalogue mais sans aucune ligne dans snapshot_facts. Jamais assimile a zero."""
+    snapshot_id: int
+    document_id: int
+    kind: str
+    direction: str | None
+    collection: str
+    fact_code: str
+    reason_code: str  # FACT_NOT_PRESENT (en-tete) ou COLLECTION_NOT_PRESENT
+
+@dataclass(frozen=True)
+class StaleSnapshot:
+    """Snapshot CURRENT produit par une autre version du normaliseur : ses faits sont a re-verifier."""
+    snapshot_id: int
+    document_id: int
+    kind: str
+    normalizer_version: str
+    expected_version: str
+
+
 @dataclass
 class ReliableFacts:
     facts: list[FactView] = field(default_factory=list)
     excluded: list[FactView] = field(default_factory=list)
+    missing: list[MissingFact] = field(default_factory=list)
+    stale: list[StaleSnapshot] = field(default_factory=list)
 
 
 class FiscalDataUnreliable(StructureError):
-    """Une donnee requise est non fiable ou absente : le calcul doit etre bloque."""
+    """Une donnee requise est non fiable, absente, non presente, ou issue d'un normaliseur perime."""
 
-    def __init__(self, message: str, excluded: list[FactView]):
+    def __init__(self, message: str, excluded: list[FactView],
+                 missing: list[MissingFact] | None = None, stale: list[StaleSnapshot] | None = None):
         super().__init__("FISCAL_DATA_UNRELIABLE", message)
         self.excluded = excluded
-
+        self.missing = missing or []
+        self.stale = stale or []
 
 @dataclass
 class SnapshotDetail:
@@ -79,6 +104,29 @@ def _has_typed_value(view: FactView) -> bool:
     if view.value_type in ("DATE", "MONTH"):
         return view.value_date is not None
     return view.value_text is not None
+
+def expected_facts(kind: str) -> tuple[tuple[str, str], ...]:
+    """Faits attendus pour un type de piece, derives du catalogue de normalisation (une seule source)."""
+    spec = CATALOG.get(kind)
+    if spec is None:
+        return ()
+    attendus = [("", s.code) for s in spec.header]
+    for name, specs in spec.collections.items():
+        attendus += [(name, s.code) for s in specs]
+    return tuple(attendus)
+
+
+def _current(db: Session, company_id: int, tax_period_id: int, kind: str | None, direction: str | None):
+    stmt = select(DocumentSnapshot).where(
+        DocumentSnapshot.company_id == company_id,
+        DocumentSnapshot.tax_period_id == tax_period_id,
+        DocumentSnapshot.status == "CURRENT",
+    )
+    if kind is not None:
+        stmt = stmt.where(DocumentSnapshot.kind == kind)
+    if direction is not None:
+        stmt = stmt.where(DocumentSnapshot.direction == direction)
+    return list(db.scalars(stmt.order_by(DocumentSnapshot.document_id)))
 
 
 def _rows(db: Session, company_id: int, tax_period_id: int, kind: str | None, direction: str | None):
@@ -109,9 +157,13 @@ def get_reliable_facts(
     collection: str | None = None,
     fact_codes: Sequence[str] | None = None,
 ) -> ReliableFacts:
-    """Faits RELIABLE des snapshots CURRENT d'une periode, plus les faits exclus avec leur raison."""
+    """Faits RELIABLE des snapshots CURRENT d'une periode, les faits exclus avec leur raison, et les faits
+    attendus par le catalogue mais sans aucune ligne (missing). Ignorer excluded ET missing est une erreur :
+    utiliser require_reliable pour bloquer."""
     result = ReliableFacts()
+    present: dict[int, set[tuple[str, str]]] = {}
     for snap, fact in _rows(db, company_id, tax_period_id, kind, direction):
+        present.setdefault(snap.id, set()).add((fact.collection, fact.fact_code))
         if collection is not None and fact.collection != collection:
             continue
         if fact_codes is not None and fact.fact_code not in fact_codes:
@@ -121,6 +173,25 @@ def get_reliable_facts(
             result.facts.append(view)
         else:
             result.excluded.append(view)
+
+    for snap in _current(db, company_id, tax_period_id, kind, direction):
+        if is_stale(snap):
+            result.stale.append(StaleSnapshot(
+                snapshot_id=snap.id, document_id=snap.document_id, kind=snap.kind,
+                normalizer_version=snap.normalizer_version, expected_version=NORMALIZER_VERSION,
+            ))
+        have = present.get(snap.id, set())
+        for coll, code in expected_facts(snap.kind):
+            if collection is not None and coll != collection:
+                continue
+            if fact_codes is not None and code not in fact_codes:
+                continue
+            if (coll, code) not in have:
+                result.missing.append(MissingFact(
+                    snapshot_id=snap.id, document_id=snap.document_id, kind=snap.kind, direction=snap.direction,
+                    collection=coll, fact_code=code,
+                    reason_code="COLLECTION_NOT_PRESENT" if coll else "FACT_NOT_PRESENT",
+                ))
     return result
 
 
@@ -132,14 +203,32 @@ def require_reliable(
     kind: str,
     required: Sequence[tuple[str, str]],
     direction: str | None = None,
+    allow_stale: bool = False,
 ) -> list[FactView]:
-    """Faits requis (collection, code), tous fiables. Sinon FiscalDataUnreliable : jamais d'omission silencieuse."""
     wanted = set(required)
+    inconnus = wanted - set(expected_facts(kind))
+    if inconnus:
+        raise StructureError(
+            "FISCAL_DATA_REQUIRED_UNKNOWN", f"faits requis inconnus du catalogue pour {kind} : {sorted(inconnus)}"
+        )
     found = get_reliable_facts(db, company_id, tax_period_id, kind=kind, direction=direction)
     bad = [e for e in found.excluded if (e.collection, e.fact_code) in wanted]
-    if bad:
-        detail = ", ".join(f"doc {e.document_id} {e.source_path} ({e.reason_code or e.reliability})" for e in bad[:10])
-        raise FiscalDataUnreliable(f"{len(bad)} donnee(s) requise(s) non fiable(s) ou absente(s) : {detail}", bad)
+    gaps = [m for m in found.missing if (m.collection, m.fact_code) in wanted]
+    stale = [] if allow_stale else found.stale
+    if bad or gaps or stale:
+        parts = []
+        if bad:
+            detail = ", ".join(f"doc {e.document_id} {e.source_path} ({e.reason_code or e.reliability})" for e in bad[:10])
+            parts.append(f"{len(bad)} donnee(s) requise(s) non fiable(s) ou absente(s) : {detail}")
+        if gaps:
+            detail = ", ".join(f"doc {m.document_id} {m.collection or '-'}.{m.fact_code} ({m.reason_code})" for m in gaps[:10])
+            parts.append(f"{len(gaps)} donnee(s) requise(s) non presente(s) : {detail}")
+        if stale:
+            detail = ", ".join(
+                f"doc {s.document_id} (normaliseur {s.normalizer_version}, attendu {s.expected_version})" for s in stale[:10]
+            )
+            parts.append(f"{len(stale)} snapshot(s) produit(s) par une ancienne version du normaliseur : {detail}")
+        raise FiscalDataUnreliable(" ; ".join(parts), bad, gaps, stale)
     return [f for f in found.facts if (f.collection, f.fact_code) in wanted]
 
 

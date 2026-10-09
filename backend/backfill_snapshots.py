@@ -16,9 +16,9 @@ from app.audit import log_action
 from app.database import SessionLocal
 from app.intervals import StructureError
 from app.models import AuditLog, Document
-from app.normalization import CATALOG
+from app.normalization import CATALOG, NORMALIZER_VERSION
 from app.snapshots import (
-    canonical_fields, compute_fingerprint, create_or_confirm_snapshot, current_snapshot,
+    canonical_fields, compute_fingerprint, create_or_confirm_snapshot, current_snapshot,is_stale,
 )
 
 
@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="n'ecrit rien, affiche seulement")
     args = parser.parse_args()
 
-    counts = {"CREE": 0, "DEJA_OK": 0, "DIVERGENT": 0, "INVALIDE": 0}
+    counts = {"CREE": 0, "DEJA_OK": 0, "DIVERGENT": 0, "INVALIDE": 0, "STALE": 0}
     with SessionLocal() as db:
         docs = db.scalars(
             select(Document)
@@ -59,9 +59,14 @@ def main() -> None:
             current = current_snapshot(db, doc.id, doc.company_id)
             if current is not None:
                 same = current.fingerprint == compute_fingerprint(doc.kind, doc.direction, doc.tax_period_id, fields)
-                counts["DEJA_OK" if same else "DIVERGENT"] += 1
-                if not same:
-                    print(f"DIVERGENT  doc={doc.id} : le snapshot courant (v{current.version}) differe de la piece")
+                if same and is_stale(current):
+                    counts["STALE"] += 1
+                    print(f"STALE      doc={doc.id} : snapshot v{current.version} issu du normaliseur "
+                          f"{current.normalizer_version} (courant {NORMALIZER_VERSION}), rien n'est reecrit")
+                else:
+                    counts["DEJA_OK" if same else "DIVERGENT"] += 1
+                    if not same:
+                        print(f"DIVERGENT  doc={doc.id} : le snapshot courant (v{current.version}) differe de la piece")
                 continue
 
             if args.dry_run:

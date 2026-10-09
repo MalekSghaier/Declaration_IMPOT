@@ -43,14 +43,23 @@ def validate_invoice(inv: InvoiceExtraction, period: str | None = None) -> list[
         if not _close(attendu, total_ttc):
             issues.append(Issue("total_ttc", f"HT+TVA+timbre={attendu} != TTC={total_ttc}", "error"))
 
-    lignes = [(_d(l.taux), _d(l.base_ht), _d(l.montant_tva)) for l in inv.lignes_tva]
-    for taux, base, montant in lignes:
-        if taux not in TAUX_VALIDES:
+    lignes = [(_d(l.taux), _d(l.base_ht), _d(l.montant_tva)) for l in (inv.lignes_tva or [])]
+    lignes_completes = True
+    for i, (taux, base, montant) in enumerate(lignes, start=1):
+        if taux is None:
+            issues.append(Issue("lignes_tva", f"ligne {i} : taux manquant", "error"))
+            lignes_completes = False
+        elif taux not in TAUX_VALIDES:
             issues.append(Issue("lignes_tva", f"taux invalide : {taux}", "error"))
-        elif not _close(base * taux / 100, montant):
+
+        if base is None or montant is None:
+            issues.append(Issue("lignes_tva", f"ligne {i} : base HT ou montant TVA manquant", "warning"))
+            lignes_completes = False
+        elif taux in TAUX_VALIDES and not _close(base * taux / 100, montant):
             issues.append(Issue("lignes_tva", f"base {base} x {taux}% != {montant}", "warning"))
 
-    if lignes:
+    # Les sommes ne sont comparables que si toutes les lignes sont completes
+    if lignes and lignes_completes:
         if total_tva is not None and not _close(sum(m for _, _, m in lignes), total_tva):
             issues.append(Issue("total_tva", "somme des lignes != total TVA", "error"))
         if total_ht is not None and not _close(sum(b for _, b, _ in lignes), total_ht):

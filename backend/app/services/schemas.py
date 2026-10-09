@@ -10,9 +10,9 @@ from pydantic import BaseModel, Field
 
 
 class TvaLine(BaseModel):
-    taux: float
-    base_ht: float
-    montant_tva: float
+    taux: float | None = None
+    base_ht: float | None = None
+    montant_tva: float | None = None
 
 
 class InvoiceExtraction(BaseModel):

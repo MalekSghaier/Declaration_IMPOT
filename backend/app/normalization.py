@@ -10,8 +10,12 @@ Principes :
 - invalide, ambigu ou non fini -> UNRELIABLE avec un code de raison, jamais devine
   (une date n'est lue qu'en ISO AAAA-MM-JJ : JJ/MM et MM/JJ sont ambigus) ;
 - montants : Decimal(str(x)), aucun arrondi, aucune echelle imposee ;
-- aucune unite par defaut : la devise vient du document, sinon NULL ; "%" pour un taux est une
-  convention de representation du schema actuel, pas une regle.
+- aucune unite par defaut et aucun code de devise connu ici : la devise est RESOLUE par l'appelant
+  (liste de reference CURRENCY) et transmise via `resolved`.
+  Devise presente mais non resolue (inconnue, ambigue, absente de `resolved`) : le fait devise et
+  tous les montants du document deviennent UNRELIABLE (fail closed) ;
+  devise absente : fait ABSENT, montants fiables sans unite (NULL) ;
+  "%" pour un taux est une convention de representation du schema actuel, pas une regle.
 
 Le catalogue decrit, par type de piece, les faits attendus : ajouter un type de piece = ajouter une
 entree, sans migration. Tout changement de comportement exige de changer NORMALIZER_VERSION.
@@ -19,22 +23,20 @@ entree, sans migration. Tout changement de comportement exige de changer NORMALI
 import datetime as dt
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
 from app.intervals import StructureError
-from app.services.validation import DEVISES_DINAR
 from app.tax_period_service import parse_month
 
-NORMALIZER_VERSION = "1"
+NORMALIZER_VERSION = "2"
 
 AMOUNT, RATE, DATE, MONTH, TEXT, CODE = "AMOUNT", "RATE", "DATE", "MONTH", "TEXT", "CODE"
 RELIABLE, UNRELIABLE, ABSENT = "RELIABLE", "UNRELIABLE", "ABSENT"
-CURRENCY = "CURRENCY"  # parseur de devise (le fait reste de type CODE)
 
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_CURRENCY = re.compile(r"[A-Z]{2,10}")
 
 
 @dataclass(frozen=True)
@@ -54,8 +56,12 @@ def _bad(reason: str) -> Parsed:
     return Parsed(UNRELIABLE, reason)
 
 
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def parse_amount(value: Any) -> Parsed:
-    if value is None or (isinstance(value, str) and not value.strip()):
+    if _is_blank(value):
         return _absent()
     if isinstance(value, bool):
         return _bad("NOT_A_NUMBER")
@@ -75,7 +81,7 @@ def parse_amount(value: Any) -> Parsed:
 
 
 def parse_date(value: Any) -> Parsed:
-    if value is None or (isinstance(value, str) and not value.strip()):
+    if _is_blank(value):
         return _absent()
     if isinstance(value, dt.datetime):
         return _bad("NOT_A_DATE")
@@ -94,7 +100,7 @@ def parse_date(value: Any) -> Parsed:
 
 def parse_month_value(value: Any) -> Parsed:
     """Mois AAAA-MM : stocke comme premier jour du mois."""
-    if value is None or (isinstance(value, str) and not value.strip()):
+    if _is_blank(value):
         return _absent()
     if not isinstance(value, str):
         return _bad("NOT_A_MONTH")
@@ -124,23 +130,6 @@ def parse_code(value: Any) -> Parsed:
     return Parsed(RELIABLE, value_text=text) if text else _absent()
 
 
-def parse_currency(value: Any) -> Parsed:
-    """Devise : majuscules, alias dinar vers TND. Une devise inconnue reste un code fiable
-    (c'est aux regles de l'etape 7 de l'accepter ou non) ; un texte qui n'est pas un code est refuse."""
-    if value is None:
-        return _absent()
-    if not isinstance(value, str):
-        return _bad("NOT_TEXT")
-    text = "".join(value.split()).replace(".", "").upper()
-    if not text:
-        return _absent()
-    if text in DEVISES_DINAR:
-        return Parsed(RELIABLE, value_text="TND")
-    if _CURRENCY.fullmatch(text):
-        return Parsed(RELIABLE, value_text=text)
-    return _bad("INVALID_CURRENCY")
-
-
 _PARSERS = {
     AMOUNT: parse_amount,
     RATE: parse_amount,
@@ -148,7 +137,6 @@ _PARSERS = {
     MONTH: parse_month_value,
     TEXT: parse_text,
     CODE: parse_code,
-    CURRENCY: parse_currency,
 }
 
 
@@ -157,14 +145,15 @@ class FactSpec:
     code: str
     value_type: str
     key: str | None = None  # cle dans les champs sources (par defaut : code)
-    parser: str | None = None  # parseur special (par defaut : celui du value_type)
 
 
 @dataclass(frozen=True)
 class KindSpec:
     header: tuple[FactSpec, ...]
     collections: dict[str, tuple[FactSpec, ...]] = field(default_factory=dict)
-    currency_fact: str | None = None  # fait portant la devise du document (unite des montants)
+    # Fait portant la devise du document (unite des montants). Sa valeur est resolue par l'appelant
+    # (liste de reference CURRENCY) et transmise a normalize_document via `resolved`.
+    currency_fact: str | None = None
 
 
 CATALOG: dict[str, KindSpec] = {
@@ -180,7 +169,7 @@ CATALOG: dict[str, KindSpec] = {
             FactSpec("total_tva", AMOUNT),
             FactSpec("timbre", AMOUNT),
             FactSpec("total_ttc", AMOUNT),
-            FactSpec("devise", CODE, parser=CURRENCY),
+            FactSpec("devise", CODE),
         ),
         collections={
             "lignes_tva": (
@@ -202,7 +191,7 @@ CATALOG: dict[str, KindSpec] = {
             FactSpec("css", AMOUNT),
             FactSpec("net_a_payer", AMOUNT),
         ),
-        # Aucune devise dans le schema d'une fiche de paie : unite NULL, jamais TND suppose.
+        # Aucune devise dans le schema d'une fiche de paie : unite NULL, jamais de devise supposee.
     ),
 }
 
@@ -223,6 +212,19 @@ class NormalizedFact:
     source_path: str
 
 
+def currency_inputs(kind: str, fields: dict) -> dict[str, Any]:
+    """Valeurs brutes de devise a resoudre par l'appelant : {fact_code: valeur}.
+    Vide si le type de piece n'a pas de devise ou si la devise est absente (rien a resoudre)."""
+    spec = CATALOG.get(kind)
+    if spec is None or not spec.currency_fact or not isinstance(fields, dict):
+        return {}
+    currency_spec = next(s for s in spec.header if s.code == spec.currency_fact)
+    raw = fields.get(currency_spec.key or currency_spec.code)
+    if _is_blank(raw):
+        return {}
+    return {spec.currency_fact: raw}
+
+
 def _unit(value_type: str, currency: str | None) -> str | None:
     if value_type == AMOUNT:
         return currency
@@ -233,9 +235,12 @@ def _unit(value_type: str, currency: str | None) -> str | None:
 
 def _build(
     spec: FactSpec, raw: Any, collection: str, index: int, path: str, currency: str | None,
-    forced: Parsed | None = None,
+    forced: Parsed | None = None, blocked: bool = False,
 ) -> NormalizedFact:
-    parsed = forced if forced is not None else _PARSERS[spec.parser or spec.value_type](raw)
+    parsed = forced if forced is not None else _PARSERS[spec.value_type](raw)
+    # Devise presente mais non resolue : un montant sans unite connue ne doit jamais etre utilisable.
+    if forced is None and blocked and spec.value_type == AMOUNT and parsed.reliability == RELIABLE:
+        parsed = _bad("CURRENCY_UNRESOLVED")
     reliable = parsed.reliability == RELIABLE
     return NormalizedFact(
         collection=collection,
@@ -253,26 +258,43 @@ def _build(
     )
 
 
-def normalize_document(kind: str, fields: dict) -> list[NormalizedFact]:
+def normalize_document(
+    kind: str, fields: dict, *, resolved: Mapping[str, Parsed] | None = None
+) -> list[NormalizedFact]:
     """Faits normalises d'une piece. Ne leve jamais pour une valeur illisible (elle devient UNRELIABLE) ;
-    leve StructureError seulement pour un type de piece inconnu ou des champs qui ne sont pas un objet."""
+    leve StructureError seulement pour un type de piece inconnu ou des champs qui ne sont pas un objet.
+
+    `resolved` : devises resolues par l'appelant, {fact_code: Parsed}. Sans entree pour une devise
+    presente, le fait devient UNRELIABLE (CURRENCY_NOT_RESOLVED)."""
     spec = CATALOG.get(kind)
     if spec is None:
         raise StructureError("NORMALIZATION_KIND_UNSUPPORTED", f"type de piece non supporte : {kind!r}")
     if not isinstance(fields, dict):
         raise StructureError("NORMALIZATION_INPUT_INVALID", "les champs valides doivent etre un objet")
 
-    currency = None
-    if spec.currency_fact:
-        currency_spec = next(s for s in spec.header if s.code == spec.currency_fact)
-        parsed = _PARSERS[currency_spec.parser or currency_spec.value_type](fields.get(currency_spec.key or currency_spec.code))
-        if parsed.reliability == RELIABLE:
-            currency = parsed.value_text
+    currency_code = spec.currency_fact
+    currency_parsed: Parsed | None = None
+    if currency_code:
+        currency_spec = next(s for s in spec.header if s.code == currency_code)
+        raw_currency = fields.get(currency_spec.key or currency_spec.code)
+        if _is_blank(raw_currency):
+            currency_parsed = _absent()
+        elif resolved is not None and currency_code in resolved:
+            currency_parsed = resolved[currency_code]
+        else:
+            currency_parsed = _bad("CURRENCY_NOT_RESOLVED")
+    currency = (
+        currency_parsed.value_text if currency_parsed is not None and currency_parsed.reliability == RELIABLE else None
+    )
+    blocked = currency_parsed is not None and currency_parsed.reliability == UNRELIABLE
 
     facts: list[NormalizedFact] = []
     for s in spec.header:
         key = s.key or s.code
-        facts.append(_build(s, fields.get(key), "", 0, key, currency))
+        if s.code == currency_code:
+            facts.append(_build(s, fields.get(key), "", 0, key, currency, forced=currency_parsed))
+        else:
+            facts.append(_build(s, fields.get(key), "", 0, key, currency, blocked=blocked))
 
     for name, specs in spec.collections.items():
         items = fields.get(name)
@@ -289,5 +311,5 @@ def normalize_document(kind: str, fields: dict) -> list[NormalizedFact]:
                 if not isinstance(item, dict):
                     facts.append(_build(s, item, name, i, path, currency, forced=_bad("NOT_AN_OBJECT")))
                 else:
-                    facts.append(_build(s, item.get(key), name, i, path, currency))
+                    facts.append(_build(s, item.get(key), name, i, path, currency, blocked=blocked))
     return facts
