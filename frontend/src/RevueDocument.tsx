@@ -70,6 +70,7 @@ export default function RevueDocument() {
   const [direction, setDirection] = useState<"VENTE" | "ACHAT" | "">("");
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [isPdf, setIsPdf] = useState(false);
+  const [isDocx, setIsDocx] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -80,6 +81,7 @@ export default function RevueDocument() {
     setIssues(data.extracted_data?.issues ?? []);
     setDirection((data.direction as "VENTE" | "ACHAT") ?? "");
     setIsPdf(data.filename.toLowerCase().endsWith(".pdf"));
+    setIsDocx(data.filename.toLowerCase().endsWith(".docx"));
     const url = await fetchFileBlobUrl(`/pieces/${id}/file`);
     setFileUrl(url);
   }, [id]);
@@ -145,7 +147,17 @@ export default function RevueDocument() {
 
       <div className="rv-grid">
         <div className="rv-preview">
-          {fileUrl && (isPdf ? <iframe src={fileUrl} title="document" /> : <img src={fileUrl} alt="document" />)}
+          {fileUrl &&
+            (isPdf ? (
+              <iframe src={fileUrl} title="document" />
+            ) : isDocx ? (
+              <p className="db-muted">
+                Aperçu indisponible pour un fichier Word.{" "}
+                <a href={fileUrl} download={piece.filename}>Télécharger</a>
+              </p>
+            ) : (
+              <img src={fileUrl} alt="document" />
+            ))}
         </div>
 
         <div className="rv-form">

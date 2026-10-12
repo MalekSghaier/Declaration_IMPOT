@@ -28,13 +28,14 @@ from app.reference import ReferenceAmbiguous, resolve_reference
 from app.services.document_reader import read_document
 from app.services.extraction import extract_patente, extract_rne
 from app.services.schemas import CompanyProfile, PatenteExtraction, RNEExtraction
+from app.upload_rules import (
+    ALLOWED_EXTENSIONS, FORMATS_LABEL, detect_content_type, extension_matches, max_size_label,
+)
+
 
 logger = logging.getLogger("app.onboarding")
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
-
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
-
 
 # Donnees fictives utilisees uniquement quand OCR_MOCK=true
 MOCK_PATENTE = PatenteExtraction(
@@ -107,27 +108,29 @@ def _extract_fields(raw: bytes, ext: str, kind: str) -> tuple[BaseModel, str]:
 
 
 def _process(company_id: int, kind: str, upload: UploadFile, db: Session) -> BaseModel:
-    """Stocke le fichier dans MinIO, l'OCRise si besoin, extrait les champs.
 
-    Trace chaque champ extrait dans extracted_fields (etape 2d). Une nouvelle
-    extraction d'un meme document ne peut PAS ecraser un champ CORRECTED ou
-    CONFIRMED (protection portee par document_fields.record_extraction).
-    """
-    raw = upload.file.read()
+    raw = upload.file.read(settings.UPLOAD_MAX_FILE_BYTES + 1)  # lecture bornée
     if not raw:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{kind} : fichier vide")
     if len(raw) > settings.UPLOAD_MAX_FILE_BYTES:
-        max_mo = settings.UPLOAD_MAX_FILE_BYTES // (1024 * 1024)
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"{kind} : fichier trop volumineux ({max_mo} Mo max)")
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"{kind} : fichier trop volumineux ({max_size_label()} max)",
+        )
 
     ext = Path(upload.filename or "").suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{kind} : format non supporte (PDF, PNG ou JPG)")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{kind} : format non supporte ({FORMATS_LABEL})")
+    content_type = detect_content_type(raw)
+    if content_type is None or not extension_matches(ext, content_type):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"{kind} : contenu non reconnu ou different de l'extension ({FORMATS_LABEL})",
+        )
 
     sha256 = hashlib.sha256(raw).hexdigest()
     key = f"{company_id}/{kind.lower()}{ext}"
-    storage.upload_bytes(key, raw, upload.content_type or "application/octet-stream")
-
+    storage.upload_bytes(key, raw, content_type)
     extracted, method = _extract_fields(raw, ext, kind)
 
     doc = db.scalar(select(Document).where(Document.company_id == company_id, Document.kind == kind))

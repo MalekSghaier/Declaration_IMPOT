@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { api, fetchFileBlobUrl } from "./api";
 import "./RevueDocument.css";   // reutilise le style existant
@@ -54,12 +54,14 @@ function errorMessage(e: unknown): string {
 export default function RevueFichePaie() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-
+  const [searchParams] = useSearchParams();
+  const period = searchParams.get("period");
   const [piece, setPiece] = useState<PieceDetail | null>(null);
   const [fields, setFields] = useState<Fields>(emptyFields);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [isPdf, setIsPdf] = useState(false);
+  const [isDocx, setIsDocx] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -69,6 +71,7 @@ export default function RevueFichePaie() {
     setFields(data.extracted_data?.fields ?? emptyFields);
     setIssues(data.extracted_data?.issues ?? []);
     setIsPdf(data.filename.toLowerCase().endsWith(".pdf"));
+    setIsDocx(data.filename.toLowerCase().endsWith(".docx"));
     const url = await fetchFileBlobUrl(`/pieces/${id}/file`);
     setFileUrl(url);
   }, [id]);
@@ -95,7 +98,14 @@ export default function RevueFichePaie() {
       });
       setPiece(data);
       setIssues(data.extracted_data?.issues ?? []);
-      if (action !== "save") navigate("/dashboard/nouveau-document");
+      if (action !== "save") {
+        if (period) {
+          navigate(`/dashboard/nouveau-document?period=${period}`);
+        }else {
+          navigate("/dashboard/nouveau-document");
+        }
+        
+      }
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -115,7 +125,17 @@ export default function RevueFichePaie() {
 
       <div className="rv-grid">
         <div className="rv-preview">
-          {fileUrl && (isPdf ? <iframe src={fileUrl} title="document" /> : <img src={fileUrl} alt="document" />)}
+          {fileUrl &&
+            (isPdf ? (
+              <iframe src={fileUrl} title="document" />
+            ) : isDocx ? (
+              <p className="db-muted">
+                Aperçu indisponible pour un fichier Word.{" "}
+                <a href={fileUrl} download={piece.filename}>Télécharger</a>
+              </p>
+            ) : (
+              <img src={fileUrl} alt="document" />
+            ))}
         </div>
 
         <div className="rv-form">

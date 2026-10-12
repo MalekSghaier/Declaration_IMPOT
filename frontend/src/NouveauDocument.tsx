@@ -23,6 +23,8 @@ const MONTH_RE = /^[0-9]{4}-(0[1-9]|1[0-2])$/;
 const POLL_MS = 2000;
 const MAX_PROBLEMS_SHOWN = 50;
 const MAX_PIECES_SHOWN = 100;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_BATCH_BYTES = 100 * 1024 * 1024;
 
 const STATUS_LABELS: Record<string, string> = {
   UPLOADED: "En attente",
@@ -34,6 +36,23 @@ const STATUS_LABELS: Record<string, string> = {
   FAILED: "Échec",
 };
 
+function makeBatches(files: File[]): File[][] {
+  const batches: File[][] = [];
+  let cur: File[] = [];
+  let size = 0;
+  for (const f of files) {
+    if (cur.length && (cur.length >= BATCH_SIZE || size + f.size > MAX_BATCH_BYTES)) {
+ 
+      batches.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(f);
+    size += f.size;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
 function currentMonth(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -102,22 +121,41 @@ function DropZone({ kind, title, hint, period, processed }: ZoneProps) {
     setError(null);
     setReport(null);
     setSent(0);
-    setToSend(files.length);
 
     const rep: Report = { accepted: 0, duplicates: 0, rejected: 0, problems: [] };
+
+    // Fichiers trop volumineux : refusés côté client, sans être envoyés
+    const valid: File[] = [];
+    for (const f of files) {
+      if (f.size > MAX_FILE_BYTES) {
+        rep.rejected += 1;
+        rep.problems.push({
+          filename: f.name,
+          status: "rejected",
+          document_id: null,
+          reason: "fichier trop volumineux (50 Mo max)",
+        });
+      } else {
+        valid.push(f);
+      }
+    }
+    setToSend(valid.length);
+
+    let sentCount = 0;
     try {
-      for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      for (const batch of makeBatches(valid)) {
         const form = new FormData();
         form.append("kind", kind);
         form.append("period", period);
-        files.slice(i, i + BATCH_SIZE).forEach((f) => form.append("files", f));
+        batch.forEach((f) => form.append("files", f));
 
         const { data } = await api.post<UploadOut>("/pieces/upload", form);
         rep.accepted += data.accepted;
         rep.duplicates += data.duplicates;
         rep.rejected += data.rejected;
         rep.problems.push(...data.results.filter((r) => r.status !== "accepted"));
-        setSent(Math.min(i + BATCH_SIZE, files.length));
+        sentCount += batch.length;
+        setSent(sentCount);
         void refresh();
       }
     } catch (e) {
@@ -158,7 +196,7 @@ function DropZone({ kind, title, hint, period, processed }: ZoneProps) {
           <input
             type="file"
             multiple
-            accept=".pdf,.png,.jpg,.jpeg"
+            accept=".pdf,.png,.jpg,.jpeg,.docx"
             disabled={uploading}
             hidden
             onChange={(e) => {
@@ -271,11 +309,11 @@ export default function NouveauDocument() {
       </label>
 
       <div className="nd-grid">
-        <DropZone kind="FACTURE" title="Factures" hint="PDF, PNG ou JPG" period={period} processed />
+        <DropZone kind="FACTURE" title="Factures" hint="PDF, PNG ,JPG, DOCX" period={period} processed />
         <DropZone
           kind="FICHE_PAIE"
           title="Fiches de paie"
-          hint="PDF, PNG ou JPG"
+          hint="PDF, PNG ,JPG, DOCX"
           period={period}
           processed
         />

@@ -45,4 +45,5 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool
 
 
+
 settings = Settings()  # type: ignore[call-arg]

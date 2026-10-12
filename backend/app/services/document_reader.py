@@ -1,12 +1,16 @@
-"""Lit un document (PDF natif, PDF scanne, image) et renvoie le texte page par page.
+"""Lit un document (PDF natif, PDF scanne, image, Word .docx) et renvoie le texte page par page.
 
 Regle : on n'utilise l'OCR (payant / limite) que pour les pages qui n'ont pas de vrai texte.
+Un .docx contient deja son texte : il est lu directement, sans OCR.
 """
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import pymupdf  
+import pymupdf
+from docx import Document as DocxDocument
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 from app.services import ocr
 
@@ -31,6 +35,54 @@ def _looks_like_real_text(text: str) -> bool:
     return len(good) / len(tokens) >= MIN_WORD_RATIO
 
 
+def _read_docx(path: str) -> list[PageText]:
+    """Texte d'un .docx, dans l'ordre du document.
+
+    Les tableaux sont rendus ligne par ligne, cellules separees par ' | ', pour que
+    l'extraction (LLM) garde la structure. Un .docx n'a pas de pages : une seule PageText.
+    Non lus : zones de texte, tableaux imbriques, images.
+    """
+    try:
+        d = DocxDocument(path)
+    except Exception as exc:
+        raise ValueError("fichier illisible ou corrompu") from exc
+
+    lines: list[str] = []
+
+    # En-tetes et pieds de page (souvent l'identite de l'emetteur), sans doublons
+    seen: set[str] = set()
+    for section in d.sections:
+        for part in (section.header, section.footer):
+            for para in part.paragraphs:
+                t = para.text.strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    lines.append(t)
+
+    for child in d.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            t = Paragraph(child, d).text.strip()
+            if t:
+                lines.append(t)
+        elif tag == "tbl":
+            for row in Table(child, d).rows:
+                cells: list[str] = []
+                seen_tc: set[int] = set()
+                for cell in row.cells:
+                    # Cellule fusionnee : python-docx la renvoie plusieurs fois
+                    if id(cell._tc) in seen_tc:
+                        continue
+                    seen_tc.add(id(cell._tc))
+                    t = " ".join(cell.text.split())
+                    if t:
+                        cells.append(t)
+                if cells:
+                    lines.append(" | ".join(cells))
+
+    return [PageText(0, "native", "\n".join(lines))]
+
+
 def read_document(path: str, use_ocr: bool = True, force_ocr: bool = False) -> list[PageText]:
     p = Path(path)
     ext = p.suffix.lower()
@@ -40,6 +92,10 @@ def read_document(path: str, use_ocr: bool = True, force_ocr: bool = False) -> l
         if not use_ocr:
             return [PageText(0, "scan_non_lu", "")]
         return [PageText(0, "ocr", ocr.ocr_file(path)[0])]
+
+    # Word : le texte est deja present, jamais d'OCR (meme avec force_ocr)
+    if ext == ".docx":
+        return _read_docx(path)
 
     if ext != ".pdf":
         raise ValueError(f"Format non supporte : {ext}")

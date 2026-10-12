@@ -30,13 +30,13 @@ from app.intervals import StructureError
 from app.tax_period_service import assert_accepts_documents, get_or_create_month
 from app.tax_periods import to_http
 from app.snapshots import audit_payload, create_or_confirm_snapshot, withdraw_current
+from app.upload_rules import ALLOWED_EXTENSIONS, FORMATS_LABEL, detect_content_type, extension_matches, max_size_label
 
 logger = logging.getLogger("app.pieces")
 
 router = APIRouter(prefix="/api/pieces", tags=["pieces"])
 
 KINDS = ("FACTURE", "FICHE_PAIE")
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
 PERIOD_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")  # AAAA-MM, chiffres ASCII uniquement
 STATUSES = ("UPLOADED", "PROCESSING", "EXTRACTED", "NEEDS_REVIEW", "VALIDATED", "REJECTED", "FAILED")
 
@@ -101,17 +101,6 @@ def _to_piece_out(d: Document) -> dict:
     }
 
 
-def _detect_content_type(raw: bytes) -> str | None:
-    """Type reel du fichier d'apres son contenu (et non son nom)."""
-    if raw.startswith(b"%PDF"):
-        return "application/pdf"
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    return None
-
-
 def _find_existing(db: Session, company_id: int, sha256: str) -> int | None:
     return db.scalar(
         select(Document.id).where(
@@ -130,7 +119,7 @@ def _enqueue(document_id: int) -> None:
         logger.exception("mise en file impossible pour le document %s (reste UPLOADED)", document_id)
 
 
-def _store_one( company_id: int, kind: str, period: str, tax_period_id: int, upload: UploadFile, db: Session) -> FileResult:
+def _store_one(company_id: int, kind: str, period: str, tax_period_id: int, upload: UploadFile, db: Session) -> FileResult:
     name = Path(upload.filename or "sans_nom").name[:255]
 
     def rejected(reason: str) -> FileResult:
@@ -138,17 +127,19 @@ def _store_one( company_id: int, kind: str, period: str, tax_period_id: int, upl
 
     ext = Path(name).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return rejected("format non supporte (PDF, PNG ou JPG)")
+        return rejected(f"format non supporte ({FORMATS_LABEL})")
 
     raw = upload.file.read(settings.UPLOAD_MAX_FILE_BYTES + 1)
     if not raw:
         return rejected("fichier vide")
     if len(raw) > settings.UPLOAD_MAX_FILE_BYTES:
-        return rejected("fichier trop volumineux")
+        return rejected(f"fichier trop volumineux ({max_size_label()} max)")
 
-    content_type = _detect_content_type(raw)
+    content_type = detect_content_type(raw)
     if content_type is None:
-        return rejected("contenu non reconnu (ce n'est pas un vrai PDF, PNG ou JPG)")
+        return rejected(f"contenu non reconnu ({FORMATS_LABEL} attendus)")
+    if not extension_matches(ext, content_type):
+        return rejected("l'extension ne correspond pas au contenu du fichier")
 
     sha256 = hashlib.sha256(raw).hexdigest()
 

@@ -31,6 +31,8 @@ const EMPTY: Profile = {
 };
 
 type Phase = "select" | "loading" | "review";
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const isDocx = (f: File | null) => !!f && f.name.toLowerCase().endsWith(".docx");
 
 const IconFile = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -53,6 +55,7 @@ const IconInfo = () => (
   </svg>
 );
 
+
 function FileDrop({
   label,
   file,
@@ -66,7 +69,7 @@ function FileDrop({
     <label className={`ob-drop${file ? " has-file" : ""}`}>
       <input
         type="file"
-        accept=".pdf,.png,.jpg,.jpeg"
+        accept=".pdf,.png,.jpg,.jpeg,.docx"
         onChange={(e) => onFile(e.target.files?.[0] ?? null)}
         required
       />
@@ -78,7 +81,7 @@ function FileDrop({
       {file ? (
         <span className="ob-drop-filename">{file.name}</span>
       ) : (
-        <span className="ob-drop-hint">PDF, PNG ou JPG — glissez ou cliquez</span>
+        <span className="ob-drop-hint">PDF, PNG, JPG ou DOCX — glissez ou cliquez . 50 Mo max</span>
       )}
     </label>
   );
@@ -98,6 +101,10 @@ export default function Onboarding() {
     e.preventDefault();
     if (!patenteFile || !rneFile) {
       setError("Les deux fichiers sont requis.");
+      return;
+    }
+    if (patenteFile.size > MAX_FILE_BYTES || rneFile.size > MAX_FILE_BYTES) {
+      setError("Chaque fichier doit faire 50 Mo maximum.");
       return;
     }
     setError("");
@@ -220,15 +227,30 @@ export default function Onboarding() {
             {previews.patente && (
               <div className="ob-preview">
                 <span className="ob-preview-label">Patente</span>
-                <iframe src={previews.patente} title="patente" />
+                {isDocx(patenteFile) ? (
+                  <p className="ob-drop-hint">
+                    Aperçu indisponible pour un fichier Word.{" "}
+                    <a href={previews.patente} download={patenteFile?.name}>Télécharger</a>
+                  </p>
+                ) : (
+                  <iframe src={previews.patente} title="patente" />
+                )}
               </div>
             )}
             {previews.rne && (
               <div className="ob-preview">
                 <span className="ob-preview-label">RNE</span>
-                <iframe src={previews.rne} title="rne" />
+                {isDocx(rneFile) ? (
+                  <p className="ob-drop-hint">
+                    Aperçu indisponible pour un fichier Word.{" "}
+                    <a href={previews.rne} download={rneFile?.name}>Télécharger</a>
+                  </p>
+                ) : (
+                  <iframe src={previews.rne} title="rne" />
+                )}
               </div>
             )}
+
           </div>
 
           <div className="ob-card">
