@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import logging
 import os
 import random
@@ -10,8 +11,10 @@ from pathlib import Path
 
 import pymupdf
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app import storage
+from app import document_storage, storage
 from app.celery_app import celery_app
 from app.config import settings
 from app.database import SessionLocal
@@ -19,7 +22,7 @@ from app.services.document_reader import read_document
 from app.services.extraction import extract_invoice, extract_payslip
 from app.services.schemas import InvoiceExtraction, PayslipExtraction, TvaLine
 from app.services.validation import validate_invoice, validate_payslip
-from app.models import Company, Document
+from app.models import Company, Document, DocumentFile
 from app.services.classification import classify_direction
 
 logger = logging.getLogger("app.tasks")
@@ -122,6 +125,43 @@ def _extract_fields(doc: Document, raw: bytes) -> tuple[BaseModel, str]:
     raise ValueError(f"type de document non supporte : {doc.kind}")
 
 
+# ---------------------------------------------------------------------------
+# Garde-fou de replication (Etape F - F-1)
+# ---------------------------------------------------------------------------
+
+def _can_run_ocr(db: Session, doc: Document) -> bool:
+    """Verifie si l'OCR peut tourner sur ce document.
+
+    Cas 1 : une DocumentFile existe pour ce document -> elle doit etre REPLICATED
+    Cas 2 : aucune DocumentFile -> accepte UNIQUEMENT si le document est historique
+            (minio_key renseigne, ancien chemin sans DocumentFile)
+
+    Ne jamais contourner le garde-fou en utilisant doc.minio_key quand une
+    DocumentFile existe mais est incomplete.
+    """
+    df = db.scalar(
+        select(DocumentFile)
+        .where(DocumentFile.document_id == doc.id)
+        .order_by(DocumentFile.version.desc())
+        .limit(1)
+    )
+    if df is not None:
+        return df.status == "REPLICATED"
+    return bool(doc.minio_key)
+
+
+def _enqueue_process_piece(document_id: int) -> None:
+    """Enqueue process_piece. Ne fait pas echouer l'appelant si Redis est indisponible."""
+    try:
+        process_piece.delay(document_id)
+    except Exception:
+        logger.exception("mise en file impossible pour le document %s", document_id)
+
+
+# ---------------------------------------------------------------------------
+# process_piece (Etape F - garde-fou)
+# ---------------------------------------------------------------------------
+
 @celery_app.task(
     name="process_piece",
     bind=True,
@@ -130,7 +170,11 @@ def _extract_fields(doc: Document, raw: bytes) -> tuple[BaseModel, str]:
     ignore_result=True,
 )
 def process_piece(self, document_id: int) -> None:
-    """Traite une piece (facture ou fiche de paie) : lecture, extraction, verification."""
+    """Traite une piece (facture ou fiche de paie) : lecture, extraction, verification.
+
+    Ne demarre que si les copies physiques sont verifiees (ou si c'est un
+    document historique sans DocumentFile).
+    """
     db = SessionLocal()
     try:
         doc = db.get(Document, document_id)
@@ -144,12 +188,21 @@ def process_piece(self, document_id: int) -> None:
             logger.info("document %s ignore (statut %s)", doc.id, doc.processing_status)
             return
 
+        # Garde-fou : pas d'OCR tant que les deux copies ne sont pas verifiees.
+        if not _can_run_ocr(db, doc):
+            logger.warning(
+                "document %s : replication incomplete, OCR reporte (statut %s)",
+                doc.id, doc.processing_status,
+            )
+            return
+
         doc.processing_status = "PROCESSING"
         doc.error = None
         db.commit()
 
         try:
-            raw = storage.get_bytes(doc.minio_key)
+            # read_bytes : LOCAL d'abord, puis MINIO, puis fallback Document.minio_key
+            raw = document_storage.read_bytes(db, doc)
             fields, method = _extract_fields(doc, raw)
         except Exception as exc:
             retries = self.request.retries
@@ -194,5 +247,122 @@ def process_piece(self, document_id: int) -> None:
         doc.processing_status = "NEEDS_REVIEW" if issues else "EXTRACTED"
         db.commit()
         logger.info("document %s (%s) : %s (%d alerte(s))", doc.id, doc.kind, doc.processing_status, len(issues))
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# replicate_document (Etape F - reprise)
+# ---------------------------------------------------------------------------
+
+def _read_existing_copy(df: DocumentFile) -> bytes | None:
+    """Contenu en clair d'une copie existante (LOCAL puis MINIO), dechiffre si besoin.
+
+    Retourne None si aucune copie n'est lisible.
+    Ne verifie PAS le sha ici : la verification est faite par l'appelant.
+    """
+    return document_storage.read_existing_copy(df)
+
+
+@celery_app.task(
+    name="replicate_document",
+    bind=True,
+    max_retries=settings.PIECES_MAX_RETRIES,
+    ignore_result=True,
+)
+def replicate_document(self, document_id: int) -> None:
+    """Reprend une replication echouee (ou en cours). Si succes, enqueue process_piece.
+
+    Idempotente : peut etre appelee plusieurs fois sans effet de bord.
+    Ne cree pas de nouvelle version : reprend la version MAX existante.
+    Si aucune copie n'est disponible -> echec propre avec message clair.
+    """
+    db = SessionLocal()
+    try:
+        doc = db.get(Document, document_id)
+        if doc is None:
+            logger.warning("replicate_document : document %s introuvable", document_id)
+            return
+        if doc.kind not in ("FACTURE", "FICHE_PAIE"):
+            logger.info("replicate_document : document %s ignore (type %s)", doc.id, doc.kind)
+            return
+        if doc.processing_status not in ("UPLOADED", "PROCESSING"):
+            logger.info("replicate_document : document %s ignore (statut %s)", doc.id, doc.processing_status)
+            return
+
+        # Chercher la DocumentFile la plus recente (version MAX)
+        df = db.scalar(
+            select(DocumentFile)
+            .where(DocumentFile.document_id == doc.id)
+            .order_by(DocumentFile.version.desc())
+            .limit(1)
+        )
+        if df is None:
+            logger.warning(
+                "replicate_document : document %s sans DocumentFile, re-upload requis",
+                doc.id,
+            )
+            doc.error = "Aucune copie disponible, re-upload requis"
+            db.commit()
+            return
+
+        # Idempotence : deja replique -> juste enqueue l'OCR
+        if df.status == "REPLICATED":
+            logger.info("replicate_document : document %s deja replique, enqueue OCR", doc.id)
+            _enqueue_process_piece(doc.id)
+            return
+
+        # Lire les octets depuis une copie existante
+        raw = _read_existing_copy(df)
+        if raw is None:
+            logger.error(
+                "replicate_document : document %s sans copie lisible, re-upload requis",
+                doc.id,
+            )
+            doc.error = "Aucune copie disponible, re-upload requis"
+            db.commit()
+            return
+
+        # Verifier la coherence du sha avant de relancer
+        actual_sha = hashlib.sha256(raw).hexdigest()
+        if actual_sha != df.content_sha256:
+            logger.error(
+                "replicate_document : document %s, sha mismatch (attendu=%s, obtenu=%s)",
+                doc.id, df.content_sha256, actual_sha,
+            )
+            doc.error = "Copie existante corrompue, re-upload requis"
+            db.commit()
+            return
+
+        # Reprendre la replication sur la MEME version (F-2)
+        try:
+            df_new = document_storage.replicate(
+                db, doc, raw, df.content_type, version=df.version,
+            )
+        except document_storage.StorageError as exc:
+            retries = self.request.retries
+            transient = _is_transient(exc)
+            if transient and retries < self.max_retries:
+                delay = settings.PIECES_RETRY_BASE_SECONDS * (2**retries) + random.randint(0, 10)
+                logger.warning(
+                    "replicate_document %s : erreur temporaire (%s), retry dans %ss",
+                    doc.id, exc, delay,
+                )
+                raise self.retry(exc=exc, countdown=delay)
+            logger.exception("replicate_document %s : echec definitif", doc.id)
+            doc.error = _short_error(exc, retries, transient)
+            db.commit()
+            return
+
+        if df_new.status == "REPLICATED":
+            logger.info("replicate_document : document %s replique, enqueue OCR", doc.id)
+            doc.error = None
+            db.commit()
+            _enqueue_process_piece(doc.id)
+        else:
+            logger.warning(
+                "replicate_document : document %s toujours non replique (status=%s)",
+                doc.id, df_new.status,
+            )
     finally:
         db.close()

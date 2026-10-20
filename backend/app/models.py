@@ -13,6 +13,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     text,
+    BigInteger,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -116,6 +117,96 @@ class Document(Base):
     # FK composite (tax_period_id, company_id) -> tax_periods : voir __table_args__
     tax_period_id: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+class DocumentFile(Base):
+    """Fichier physique d'un document : une ligne = une version.
+
+    Une ligne contient les deux copies (locale et MinIO) :
+    - local_path             : chemin absolu du fichier ecrit sur disque
+    - minio_bucket, minio_key: emplacement de l'objet ecrit dans MinIO
+
+    Cycle de vie (voir app.file_status) :
+      PENDING -> REPLICATING -> REPLICATED (terminal)
+                             -> FAILED     (reprise possible via PENDING)
+
+    Immuabilite : une fois status='REPLICATED', la ligne ne doit plus etre modifiee
+    (contrainte applicative, portee par app.document_storage).
+    """
+
+    __tablename__ = "document_files"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["company_id", "document_id"],
+            ["documents.company_id", "documents.id"],
+            name="fk_document_files_document",
+        ),
+        UniqueConstraint("document_id", "version", name="uq_document_files_document_version"),
+        Index(
+            "uq_document_files_current",
+            "document_id",
+            unique=True,
+            postgresql_where=text("is_current"),
+            sqlite_where=text("is_current"),
+        ),
+        CheckConstraint("size_bytes > 0", name="ck_document_files_size"),
+        CheckConstraint("length(content_sha256) = 64", name="ck_document_files_sha256"),
+        CheckConstraint("version >= 1", name="ck_document_files_version"),
+        CheckConstraint("attempts >= 0", name="ck_document_files_attempts"),
+        CheckConstraint(
+            "status IN ('PENDING', 'REPLICATING', 'REPLICATED', 'FAILED')",
+            name="ck_document_files_status",
+        ),
+        CheckConstraint(
+            "status <> 'REPLICATING' OR lease_expires_at IS NOT NULL",
+            name="ck_document_files_lease",
+        ),
+        CheckConstraint(
+            "status <> 'REPLICATED' OR ("
+            "  local_verified_sha256 IS NOT NULL"
+            "  AND minio_verified_sha256 IS NOT NULL"
+            "  AND local_verified_sha256 = content_sha256"
+            "  AND minio_verified_sha256 = content_sha256"
+            "  AND local_verified_at IS NOT NULL"
+            "  AND minio_verified_at IS NOT NULL"
+            "  AND replicated_at IS NOT NULL"
+            ")",
+            name="ck_document_files_replicated",
+        ),
+        Index("ix_document_files_status", "status"),
+        Index("ix_document_files_content_sha256", "content_sha256"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"))
+    document_id: Mapped[int]
+    version: Mapped[int]
+    is_current: Mapped[bool] = mapped_column(default=True)
+
+    original_filename: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(128))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    checksum_computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    local_path: Mapped[str] = mapped_column(String(512))
+    minio_bucket: Mapped[str] = mapped_column(String(128))
+    minio_key: Mapped[str] = mapped_column(String(512))
+    encryption_scheme: Mapped[str | None] = mapped_column(String(32))
+
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    attempts: Mapped[int] = mapped_column(default=0)
+
+    local_verified_sha256: Mapped[str | None] = mapped_column(String(64))
+    minio_verified_sha256: Mapped[str | None] = mapped_column(String(64))
+    local_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    minio_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replicated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class ExtractedField(Base):

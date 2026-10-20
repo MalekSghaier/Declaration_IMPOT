@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import storage
+from app import document_storage, storage
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user
@@ -69,6 +69,7 @@ class PieceOut(BaseModel):
 class PieceDetailOut(PieceOut):
     error: str | None
     extracted_data: dict | None
+    is_fully_replicated: bool = False
 
 
 class PieceListOut(BaseModel):
@@ -147,18 +148,11 @@ def _store_one(company_id: int, kind: str, period: str, tax_period_id: int, uplo
     if existing is not None:
         return FileResult(filename=name, status="duplicate", document_id=existing, reason="fichier deja depose")
 
-    # Cle basee sur le SHA-256 : deux envois du meme fichier ecrivent le meme objet, sans orphelin
-    key = f"{company_id}/pieces/{sha256}{ext}"
-    try:
-        storage.upload_bytes(key, raw, content_type)
-    except Exception:
-        logger.exception("echec de l'envoi vers MinIO (%s)", name)
-        return rejected("stockage indisponible, reessayez")
-
+    # minio_key initialement vide : sera rempli par document_storage.replicate() en cas de succes
     doc = Document(
         company_id=company_id,
         kind=kind,
-        minio_key=key,
+        minio_key="",
         filename=name,
         sha256=sha256,
         processing_status="UPLOADED",
@@ -167,16 +161,36 @@ def _store_one(company_id: int, kind: str, period: str, tax_period_id: int, uplo
     )
     db.add(doc)
     try:
-        db.commit()
+        # Le flush materialise l'id et declenche les contraintes UNIQUE (company_id, sha256)
+        # avant d'ecrire sur disque/MinIO : evite d'ecrire des copies inutiles pour un doublon.
+        db.flush()
     except IntegrityError:
         # Depose en meme temps par une autre requete : l'index unique l'a bloque
         db.rollback()
         existing = _find_existing(db, company_id, sha256)
         return FileResult(filename=name, status="duplicate", document_id=existing, reason="fichier deja depose")
 
-    document_id = doc.id
-    _enqueue(document_id)
-    return FileResult(filename=name, status="accepted", document_id=document_id)
+    # Replication LOCAL + MINIO avec verifications. Le statut final du DocumentFile
+    # determine si l'on peut lancer l'OCR.
+    try:
+        df = document_storage.replicate(db, doc, raw, content_type)
+    except document_storage.StorageError as exc:
+        # Cas pathologiques (SHA_MISMATCH, EMPTY_PAYLOAD, MAX_ATTEMPTS_REACHED).
+        # Le Document reste en base pour tracabilite et reprise ulterieure ; aucun OCR n'est lance.
+        logger.warning("replication refusee pour %s : %s", name, exc)
+        return FileResult(filename=name, status="accepted", document_id=doc.id, reason=str(exc))
+
+    if df.status == "REPLICATED":
+        # Les deux copies sont ecrites et verifiees : l'OCR peut demarrer.
+        _enqueue(doc.id)
+    else:
+        # Replication incomplete : Document conserve en UPLOADED, repris manuellement plus tard.
+        logger.warning(
+            "document %s cree mais replication incomplete (status=%s, attempts=%s)",
+            doc.id, df.status, df.attempts,
+        )
+
+    return FileResult(filename=name, status="accepted", document_id=doc.id)
 
 
 @router.post("/upload", response_model=UploadOut)
@@ -212,10 +226,10 @@ def upload(
 
     results = [_store_one(user.company_id, kind, period, tax_period_id, f, db) for f in files]
     return UploadOut(
-    accepted=sum(r.status == "accepted" for r in results),
-    duplicates=sum(r.status == "duplicate" for r in results),
-    rejected=sum(r.status == "rejected" for r in results),
-    results=results,
+        accepted=sum(r.status == "accepted" for r in results),
+        duplicates=sum(r.status == "duplicate" for r in results),
+        rejected=sum(r.status == "rejected" for r in results),
+        results=results,
     )
 
 
@@ -287,7 +301,12 @@ def get_piece(piece_id: int, user: User = Depends(get_current_user), db: Session
     )
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Piece non trouvee")
-    return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)
+    return PieceDetailOut(
+        **_to_piece_out(doc),
+        error=doc.error,
+        extracted_data=doc.extracted_data,
+        is_fully_replicated=document_storage.is_fully_replicated(db, doc),
+    )
 
 
 @router.get("/{piece_id}/file")
@@ -302,9 +321,9 @@ def get_file(piece_id: int, user: User = Depends(get_current_user), db: Session 
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Piece non trouvee")
     try:
-        raw = storage.get_bytes(doc.minio_key)
-    except Exception:
-        logger.exception("lecture MinIO impossible pour le document %s", doc.id)
+        raw = document_storage.read_bytes(db, doc)
+    except document_storage.StorageError:
+        logger.exception("lecture impossible pour le document %s", doc.id)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Stockage indisponible")
     content_type = mimetypes.guess_type(doc.filename)[0] or "application/octet-stream"
     return StreamingResponse(io.BytesIO(raw), media_type=content_type)
@@ -355,7 +374,12 @@ def review_piece(
             "reject_reason": body.reject_reason,
         }
         db.commit()
-        return PieceDetailOut(**_to_piece_out(doc), error=doc.error, extracted_data=doc.extracted_data)
+        return PieceDetailOut(
+            **_to_piece_out(doc),
+            error=doc.error,
+            extracted_data=doc.extracted_data,
+            is_fully_replicated=document_storage.is_fully_replicated(db, doc),
+        )
 
     # ---------- Validation typee du payload selon le kind ----------
     if doc.kind == "FACTURE":
@@ -463,5 +487,5 @@ def review_piece(
         **_to_piece_out(doc),
         error=doc.error,
         extracted_data=doc.extracted_data,
+        is_fully_replicated=document_storage.is_fully_replicated(db, doc),
     )
-    

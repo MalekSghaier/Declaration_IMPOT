@@ -11,10 +11,10 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import storage
+from app import document_storage, storage
 from app.activities import add_activity
 from app.audit import diff_fields, log_action
 from app.config import settings
@@ -22,7 +22,7 @@ from app.database import get_db
 from app.deps import get_current_user
 from app.document_fields import record_extraction
 from app.establishments import DEFAULT_HEAD_OFFICE_NUMBER, add_establishment
-from app.models import Company, Document, ExtractedField, User
+from app.models import Company, Document, DocumentFile, ExtractedField, User
 from app.profile import NOT_IN_PROFILE, set_profile_value
 from app.reference import ReferenceAmbiguous, resolve_reference
 from app.services.document_reader import read_document
@@ -31,6 +31,7 @@ from app.services.schemas import CompanyProfile, PatenteExtraction, RNEExtractio
 from app.upload_rules import (
     ALLOWED_EXTENSIONS, FORMATS_LABEL, detect_content_type, extension_matches, max_size_label,
 )
+
 
 
 logger = logging.getLogger("app.onboarding")
@@ -108,8 +109,20 @@ def _extract_fields(raw: bytes, ext: str, kind: str) -> tuple[BaseModel, str]:
 
 
 def _process(company_id: int, kind: str, upload: UploadFile, db: Session) -> BaseModel:
+    """Valide, replique LOCAL + MINIO, puis extrait les champs.
 
-    raw = upload.file.read(settings.UPLOAD_MAX_FILE_BYTES + 1)  # lecture bornée
+    Ordre (Etape E) :
+      1. lecture + validation du fichier
+      2. calcul sha256
+      3. document_storage.replicate (LOCAL + MINIO + verifications)
+      4. si replication incomplete -> HTTPException 503, pas d'extraction
+      5. sinon -> _extract_fields puis record_extraction
+
+    E-D2 : si un DocumentFile courant existe avec un contenu DIFFERENT,
+    il est marque is_current=False (conserve en base), et une nouvelle version
+    est creee. Aucune suppression de ligne ni de fichier physique.
+    """
+    raw = upload.file.read(settings.UPLOAD_MAX_FILE_BYTES + 1)
     if not raw:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{kind} : fichier vide")
     if len(raw) > settings.UPLOAD_MAX_FILE_BYTES:
@@ -129,28 +142,83 @@ def _process(company_id: int, kind: str, upload: UploadFile, db: Session) -> Bas
         )
 
     sha256 = hashlib.sha256(raw).hexdigest()
-    key = f"{company_id}/{kind.lower()}{ext}"
-    storage.upload_bytes(key, raw, content_type)
-    extracted, method = _extract_fields(raw, ext, kind)
+    # filename calcule TOT pour ne pas oublier de le renseigner avant tout flush.
+    filename = upload.filename or f"{kind.lower()}{ext}"
 
     doc = db.scalar(select(Document).where(Document.company_id == company_id, Document.kind == kind))
-    if doc is None:
-        doc = Document(company_id=company_id, kind=kind)
-        db.add(doc)
-    doc.minio_key = key
-    doc.filename = upload.filename or f"{kind.lower()}{ext}"
-    doc.sha256 = sha256
-    doc.extracted_data = extracted.model_dump(mode="json")
-    doc.processing_status = "DONE"
 
-    # flush pour garantir doc.id avant la trace par champ
+    # --- Calcul de la version cible (E-D2) ---
+    superseded_df: DocumentFile | None = None
+    if doc is None:
+        doc = Document(
+            company_id=company_id,
+            kind=kind,
+            minio_key="",
+            filename=filename,   # NOT NULL : renseigne AVANT le flush
+            sha256=sha256,       # utile aussi tot (index d'unicite)
+        )
+        db.add(doc)
+        db.flush()
+        target_version = 1
+    else:
+        current_df = db.scalar(
+            select(DocumentFile).where(
+                DocumentFile.document_id == doc.id,
+                DocumentFile.is_current.is_(True),
+            )
+        )
+        if current_df is None:
+            target_version = 1
+        elif current_df.content_sha256 == sha256:
+            # Meme contenu : idempotent, on reutilise la version courante.
+            target_version = current_df.version
+        else:
+            # Contenu different : nouvelle version, l'ancienne reste en base.
+            max_v = db.scalar(
+                select(func.max(DocumentFile.version)).where(DocumentFile.document_id == doc.id)
+            ) or 0
+            target_version = max_v + 1
+            superseded_df = current_df
+
+    doc.filename = filename
+    doc.sha256 = sha256
+    doc.minio_key = ""  # sera rempli par replicate() en cas de succes
+    doc.processing_status = "DONE"
     db.flush()
 
-    # Trace chaque champ extrait dans extracted_fields.
+    # Supersede AVANT replicate : sinon la contrainte uq_document_files_current
+    # (une seule ligne is_current=True par document_id) serait violee.
+    if superseded_df is not None:
+        superseded_df.is_current = False
+        db.commit()
+
+    # --- Replication ---
+    try:
+        df = document_storage.replicate(db, doc, raw, content_type, version=target_version)
+    except document_storage.StorageError as exc:
+        logger.exception("[%s] replication impossible", kind)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"{kind} : stockage indisponible, reessayez dans quelques minutes.",
+        ) from exc
+
+    if df.status != "REPLICATED":
+        logger.error("[%s] replication incomplete : status=%s attempts=%s", kind, df.status, df.attempts)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"{kind} : stockage indisponible, reessayez dans quelques minutes.",
+        )
+
+    # --- Extraction (E-D4 : inchangee) ---
+    extracted, method = _extract_fields(raw, ext, kind)
+
+    doc.extracted_data = extracted.model_dump(mode="json")
+    doc.processing_status = "DONE"
+    db.flush()
+
     record_extraction(db, doc, extracted, method=method)
 
     return extracted
-
 
 def _merge(patente: PatenteExtraction, rne: RNEExtraction) -> CompanyProfile:
     # Le LLM renvoie le capital en float (Decimal refuse par Mistral) : on reconvertit ici.
@@ -349,5 +417,10 @@ def get_file(kind: str, user: User = Depends(get_current_user), db: Session = De
     )
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document non trouve")
+    try:
+        raw = document_storage.read_bytes(db, doc)
+    except document_storage.StorageError:
+        logger.exception("lecture impossible pour le document %s", doc.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Stockage indisponible")
     media_type = mimetypes.guess_type(doc.filename)[0] or "application/octet-stream"
-    return Response(content=storage.get_bytes(doc.minio_key), media_type=media_type)
+    return Response(content=raw, media_type=media_type)
