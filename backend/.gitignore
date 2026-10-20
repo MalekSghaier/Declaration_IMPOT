@@ -31,6 +31,8 @@ samples/
 node_modules/
 dist/
 
-
 #tests
 tests/
+
+# Documents stockés localement
+/storage/documents/
