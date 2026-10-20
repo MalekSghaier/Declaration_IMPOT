@@ -31,6 +31,7 @@ from app.services.schemas import CompanyProfile, PatenteExtraction, RNEExtractio
 from app.upload_rules import (
     ALLOWED_EXTENSIONS, FORMATS_LABEL, detect_content_type, extension_matches, max_size_label,
 )
+from app.upload_lock import UploadInProgress, single_slot_lock
 
 
 
@@ -273,9 +274,17 @@ def upload(
     company = db.get(Company, user.company_id)
     _ensure_not_locked(company)
 
-    patente_data = _process(user.company_id, "PATENTE", patente, db)
-    rne_data = _process(user.company_id, "RNE", rne, db)
-    db.commit()
+    try:
+        with single_slot_lock(user.company_id, "PATENTE"), single_slot_lock(user.company_id, "RNE"):
+            patente_data = _process(user.company_id, "PATENTE", patente, db)
+            rne_data = _process(user.company_id, "RNE", rne, db)
+            db.commit()
+    except UploadInProgress:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Un televersement est deja en cours pour cette societe, reessayez dans quelques instants.",
+        )
 
     return _merge(patente_data, rne_data)
 

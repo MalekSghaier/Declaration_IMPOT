@@ -11,7 +11,9 @@ Regles (voir points valides) :
 - Une copie deja verifiee n'est JAMAIS reecrite.
 - Si une seule copie est valide, le statut reste FAILED mais la copie valide est conservee.
 - Apres MAX attempts, intervention manuelle requise (reset_for_retry).
+
 """
+
 import hashlib
 import logging
 import mimetypes
@@ -23,6 +25,7 @@ from pathlib import Path
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app import document_crypto, storage
 from app.audit import log_action
@@ -57,6 +60,7 @@ class StorageError(Exception):
       NOT_FAILED            : reset_for_retry() sur un statut != FAILED
       NOT_REPLICATED        : aucun DocumentFile courant
       COPY_NOT_READABLE     : aucune copie lisible (LOCAL + MINIO)
+      VERSION_CONFLICT      : une autre requete a cree la meme version avec un contenu different
     """
 
     def __init__(self, code: str, message: str):
@@ -260,24 +264,19 @@ def _do_replicate(db: Session, df: DocumentFile, raw: bytes, content_type: str) 
         df.minio_verified_sha256 = None
         df.minio_verified_at = None
         db.commit()
-    local_ok = df.local_verified_sha256 == expected_sha
-    minio_ok = df.minio_verified_sha256 == expected_sha
-
+    # Les deux copies sont TOUJOURS reverifiees : une copie deja marquee verifiee a pu
+    # disparaitre ou changer depuis la tentative precedente. Une copie valide n'est pas reecrite.
     # --- LOCAL ---
-    if not local_ok:
-        if _ensure_local_copy(df, raw, expected_sha):
-            df.local_verified_sha256 = expected_sha
-            df.local_verified_at = _utcnow()
-            db.commit()
-            local_ok = True
+    local_ok = _ensure_local_copy(df, raw, expected_sha)
+    df.local_verified_sha256 = expected_sha if local_ok else None
+    df.local_verified_at = _utcnow() if local_ok else None
+    db.commit()
 
     # --- MINIO (toujours tente, meme si LOCAL a echoue) ---
-    if not minio_ok:
-        if _ensure_minio_copy(df, raw, content_type, expected_sha):
-            df.minio_verified_sha256 = expected_sha
-            df.minio_verified_at = _utcnow()
-            db.commit()
-            minio_ok = True
+    minio_ok = _ensure_minio_copy(df, raw, content_type, expected_sha)
+    df.minio_verified_sha256 = expected_sha if minio_ok else None
+    df.minio_verified_at = _utcnow() if minio_ok else None
+    db.commit()
 
     # --- Decision finale ---
     if local_ok and minio_ok:
@@ -353,9 +352,29 @@ def replicate(
             status="PENDING",
             attempts=0,
         )
-        db.add(df)
-        db.commit()
-        db.refresh(df)
+        try:
+            with db.begin_nested():
+                db.add(df)
+        except IntegrityError:
+            # Une autre requete a cree la meme version entre notre lecture et notre insertion.
+            # Le SAVEPOINT n'annule que cette insertion : les modifications deja faites
+            # dans la transaction (ex. Document) sont conservees.
+            df = db.scalar(
+                select(DocumentFile).where(
+                    DocumentFile.document_id == document.id,
+                    DocumentFile.version == version,
+                )
+            )
+            if df is None:
+                raise  # l'erreur n'est pas ce conflit de version : on la laisse remonter
+            if df.content_sha256 != expected_sha:
+                raise StorageError(
+                    "VERSION_CONFLICT",
+                    f"document {document.id} v{version} : une version existe deja avec un contenu different",
+                )
+        else:
+            db.commit()
+            db.refresh(df)
 
     if df.status == "REPLICATED":
         return df

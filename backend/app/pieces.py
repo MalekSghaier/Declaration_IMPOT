@@ -168,6 +168,10 @@ def _store_one(company_id: int, kind: str, period: str, tax_period_id: int, uplo
         # Depose en meme temps par une autre requete : l'index unique l'a bloque
         db.rollback()
         existing = _find_existing(db, company_id, sha256)
+        if existing is None:
+            # Aucun document identique : ce n'est PAS un doublon (autre contrainte de base violee)
+            logger.exception("insertion impossible pour %s (contrainte de base)", name)
+            return rejected("enregistrement impossible, reessayez ou contactez le support")
         return FileResult(filename=name, status="duplicate", document_id=existing, reason="fichier deja depose")
 
     # Replication LOCAL + MINIO avec verifications. Le statut final du DocumentFile
